@@ -125,7 +125,22 @@
           (kv-del! ctx (dir-key ukey))
           #t))))
 
-; ---- u64 counter helpers for composite-type meta (H#/E#/Z#) ----
+; ---- composite-type (hash/list/set/zset) lifecycle helpers ----
+;
+; A composite key exists in the directory while it has ≥1 element. Add an
+; element -> ensure the directory entry (create with no TTL if absent,
+; preserving any existing TTL). Remove an element -> if the collection is
+; now empty, purge the whole key.  Callers MUST first type-guard (a write
+; to a key holding a different type is WRONGTYPE, not a silent clobber).
+
+(define (ctype-touch! ctx ukey type-char)
+  (if (not (key-exists? ctx ukey))
+      (dir-set! ctx ukey type-char 0)))
+
+(define (purge-if-empty! ctx ukey count)
+  (if (<= count 0) (purge-key! ctx ukey)))
+
+; ---- u64 counter helpers for composite-type meta (lists use L#) ----
 
 (define (counter-get ctx metakey)
   (let ((v (kv-get ctx metakey))) (if v (bytes->u64 v 0) 0)))
