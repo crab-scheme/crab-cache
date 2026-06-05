@@ -24,7 +24,7 @@
 (define (broker-pid cfg) (table-lookup 'cc-broker (symbol->string (cfg-my-node cfg))))
 
 (define (ask-local cfg s cmd)
-  (let ((p (table-lookup 'cc-shard-pid (local-qk cfg s)))) (send p (cons (self) cmd)) (raw-receive)))
+  (let ((p (table-lookup 'cc-shard-pid (local-qk cfg s)))) (call p cmd)))
 (define (direct-local cfg s cmd)
   (let ((p (table-lookup 'cc-shard-pid (local-qk cfg s)))) (send p (list 'direct (self) cmd)) (raw-receive)))
 (define (slot-of cmd) (if (pair? (cdr cmd)) (key-slot (cadr cmd)) 0))

@@ -13,10 +13,12 @@
 ; expiry actor. The clock is what TTL deadlines are compared against, so
 ; every replica expires a key at the same logical tick (DD-3).
 (define-record-type shard-ctx
-  (fields (immutable handle shard-ctx-handle)
-          (immutable cf shard-ctx-cf)
-          (immutable sync shard-ctx-sync)            ; fsync each write? (durable mode)
-          (mutable clock shard-ctx-clock shard-ctx-clock-set!)))
+  ; accessors auto-derived: shard-ctx-handle/-cf/-sync/-clock, plus the
+  ; clock mutator set-shard-ctx-clock! (CrabScheme record-type shorthand).
+  (fields (immutable handle)
+          (immutable cf)
+          (immutable sync)            ; fsync each write? (durable mode)
+          (mutable clock)))
 
 ; (make-ctx handle [cf] [sync?])
 (define (make-ctx handle . opts)
@@ -26,7 +28,7 @@
                   0))
 
 (define (ctx-clock-advance! ctx d)
-  (shard-ctx-clock-set! ctx (+ (shard-ctx-clock ctx) d)))
+  (set-shard-ctx-clock! ctx (+ (shard-ctx-clock ctx) d)))
 (define (clock ctx) (shard-ctx-clock ctx))
 
 ; ---- raw store ops on this shard's CF ----
