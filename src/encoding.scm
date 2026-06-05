@@ -24,7 +24,6 @@
 ;   zset     Z:<lp ukey><member>           -> score (ieee f64) meta Z#:<ukey> -> u64 card
 ;            Zs:<lp ukey><score:8 order><member> -> #vu8(1)     (by-score index for ZRANGE)
 ;
-; NOTE: the in-tree bitwise OR is `bitwise-or` (not R6RS `bitwise-ior`).
 
 ; ---- small byte helpers ----
 
@@ -72,7 +71,7 @@
     (bytevector-ieee-double-set! b 0 (exact->inexact x) (endianness big))
     (if (>= (bytevector-u8-ref b 0) 128)   ; negative
         (invert-all! b)
-        (bytevector-u8-set! b 0 (bitwise-or (bytevector-u8-ref b 0) #x80)))
+        (bytevector-u8-set! b 0 (bitwise-ior (bytevector-u8-ref b 0) #x80)))
     b))
 (define (order-bytes->f64 b off)
   (let ((c (subbv b off (+ off 8))))

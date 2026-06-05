@@ -7,7 +7,11 @@
 ;   (spawn-source "(include \"src/server/peer-poller.scm\")" 'peer-poller
 ;                 NODE-NAME SHARD-KEYS TICK-EVERY)
 ;   SHARD-KEYS : list of shard-key strings whose replicas live on this node
-;   TICK-EVERY : emit a tick after this many idle poll iterations
+;   TICK-EVERY : emit a tick after this many idle poll iterations. NOTE: the
+;                idle branch uses (yield), not (sleep-ms): yield cooperatively
+;                releases this shared LocalSet worker to the co-located shard
+;                replicas, whereas sleep-ms (thread::sleep) would block the
+;                worker and starve them, stalling replication.
 
 ; dial-addrs : raft addresses of higher-named peers to (re)dial
 ; target     : expected peer count (= #nodes - 1); when we have fewer, a peer
