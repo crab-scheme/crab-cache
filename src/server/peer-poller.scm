@@ -12,11 +12,17 @@
 (define (peer-poller node-name shard-keys tick-every)
   (define (local-pid sk)
     (table-lookup 'cc-shard-pid (string-append (symbol->string node-name) ":" sk)))
-  ; frame = (shard-engine SHARD-KEY FROM RPC) -> deliver (engine FROM RPC)
+  ; route an inbound frame: a Raft RPC to its local shard replica, or a
+  ; cross-node PUBLISH to the local broker.
   (define (route! frame)
-    (if (and (pair? frame) (eq? (car frame) 'shard-engine))
-        (let ((pid (local-pid (cadr frame))))
-          (if pid (send pid (list 'engine (caddr frame) (cadddr frame)))))))
+    (cond
+      ((not (pair? frame)) #f)
+      ((eq? (car frame) 'shard-engine)
+       (let ((pid (local-pid (cadr frame))))
+         (if pid (send pid (list 'engine (caddr frame) (cadddr frame))))))
+      ((eq? (car frame) 'broker-publish)
+       (let ((b (table-lookup 'cc-broker (symbol->string node-name))))
+         (if b (send b (list 'rpublish (cadr frame) (caddr frame))))))))
   (define (tick-all!)
     (for-each (lambda (sk) (let ((p (local-pid sk))) (if p (send p (list 'tick)))))
               shard-keys))

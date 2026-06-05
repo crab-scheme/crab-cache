@@ -54,6 +54,7 @@
 (make-table 'cc-shard-role "set")
 (make-table 'cc-shard-leader "set")
 (make-table 'cc-shard-commit "set")
+(make-table 'cc-broker "set")
 (make-table 'cc-config "set")
 
 ; ---- bring up the inter-node mesh ----
@@ -88,6 +89,15 @@
 (define shard-keys (let loop ((i 0) (acc '()))
                      (if (>= i nshards) (reverse acc) (loop (+ i 1) (cons (number->string i) acc)))))
 (spawn-source "(include \"src/server/peer-poller.scm\")" 'peer-poller me shard-keys 120)
+
+; pub/sub broker: fans PUBLISH out to peer brokers over node-send (the
+; peer-poller delivers inbound broker-publish frames to it).
+(define peer-names
+  (let loop ((ns all-names) (acc '()))
+    (cond ((null? ns) (reverse acc))
+          ((eqv? (car ns) me) (loop (cdr ns) acc))
+          (else (loop (cdr ns) (cons (car ns) acc))))))
+(spawn-source "(include \"src/server/pubsub.scm\")" 'broker-main me peer-names)
 
 ; ---- config for conn-actors (MOVED uses live cc-shard-leader + these addrs) ----
 (define node-id "0000000000000000000000000000000000000000")

@@ -56,6 +56,22 @@ ck "lrange"    "a b c" "$(redis-cli -c -p 6003 lrange mylist 0 -1 2>&1 | tr '\n'
 echo
 [ "$fails" = 0 ] && echo "CLUSTER ROUTING: all passed" || echo "CLUSTER ROUTING FAILED: $fails"
 
+if [ "${1:-}" = "pubsub" ]; then
+  echo
+  echo "== cross-node pub/sub: subscribe on b, publish on a and c =="
+  timeout 6 redis-cli -p 6002 subscribe global-ch >"$DB/csub.out" 2>&1 & CSUB=$!
+  sleep 1.5
+  echo "  publish @a -> $(redis-cli -p 6001 publish global-ch hello-from-a)"
+  echo "  publish @c -> $(redis-cli -p 6003 publish global-ch hello-from-c)"
+  wait "$CSUB" 2>/dev/null
+  echo "  --- node-b subscriber stream ---"; sed 's/^/    /' "$DB/csub.out"
+  if grep -q hello-from-a "$DB/csub.out" && grep -q hello-from-c "$DB/csub.out"; then
+    echo "  CROSS-NODE PUBSUB: ok"
+  else
+    echo "  CROSS-NODE PUBSUB: FAIL"; fails=$((fails+1))
+  fi
+fi
+
 if [ "${1:-}" = "failover" ]; then
   echo
   echo "== failover: acked write on foo's shard, kill THAT shard's leader, verify =="

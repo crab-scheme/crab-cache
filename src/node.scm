@@ -36,7 +36,11 @@
 (make-table 'cc-shard-role "set")
 (make-table 'cc-shard-leader "set")
 (make-table 'cc-shard-commit "set")
+(make-table 'cc-broker "set")
 (make-table 'cc-config "set")
+
+; pub/sub broker (single node => no peers to fan out to)
+(spawn-source "(include \"src/server/pubsub.scm\")" 'broker-main node-name '())
 
 ; topology ranges: (start end host port node-id) per shard (all this node)
 (define ranges
