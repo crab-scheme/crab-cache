@@ -16,11 +16,13 @@ trap cleanup EXIT
 cd "$ROOT"
 
 echo "== launching 3-node cluster =="
-for n in a b c; do
+DURABLE="${DURABLE:-no}"
+start_one(){ # start_one <node>
   CRABSCHEME_ACTOR_LOCAL_WORKERS=60 "$BIN" run src/node-cluster.scm -- \
-      --node "$n" --shards 3 --db "$DB/$n" --cluster "$SPEC" >"$DB/$n.log" 2>&1 &
-  PID[$n]=$!
-done
+      --node "$1" --shards 3 --db "$DB/$1" --durable "$DURABLE" --cluster "$SPEC" >"$DB/$1.log" 2>&1 &
+  PID[$1]=$!
+}
+for n in a b c; do start_one "$n"; done
 
 # wait for every client port to answer PING
 for n in a b c; do
@@ -70,6 +72,32 @@ if [ "${1:-}" = "pubsub" ]; then
   else
     echo "  CROSS-NODE PUBSUB: FAIL"; fails=$((fails+1))
   fi
+fi
+
+if [ "${1:-}" = "rejoin" ]; then
+  echo
+  echo "== restart-rejoin: fill, kill a node, write more while it's down, restart, converge =="
+  # every node replicates every shard, so node b's per-node DBSIZE == cluster keys.
+  base=$(redis-cli -p 6002 dbsize)
+  for i in $(seq 1 30); do redis-cli -c -p 6001 set "rk:$i" "v$i" >/dev/null 2>&1; done
+  echo "  node-b dbsize before kill = $(redis-cli -p 6002 dbsize) (base $base + 30)"
+  echo "  killing node b"
+  kill "${PID[b]}" 2>/dev/null; PID[b]=""; sleep 1
+  # write 20 MORE keys while b is down (commit on the a+c quorum)
+  for i in $(seq 31 50); do redis-cli -c -p 6001 set "rk:$i" "v$i" >/dev/null 2>&1; done
+  echo "  wrote 20 more keys while b was down"
+  echo "  restarting node b"
+  start_one b
+  for _ in $(seq 1 120); do redis-cli -p 6002 ping 2>/dev/null | grep -q PONG && break; sleep 0.25; done
+  # b must catch up the 20 it missed via re-replication -> per-node dbsize reaches base+50
+  expect=$((base + 50)); conv=0
+  for _ in $(seq 1 100); do
+    [ "$(redis-cli -p 6002 dbsize 2>/dev/null)" = "$expect" ] && { conv=1; break; }
+    sleep 0.5
+  done
+  echo "  node-b dbsize after rejoin = $(redis-cli -p 6002 dbsize) (expect $expect)"
+  ck "rejoined node caught up the writes it missed" "$expect" "$(redis-cli -p 6002 dbsize)"
+  ck "rejoined node converged" "1" "$conv"
 fi
 
 if [ "${1:-}" = "failover" ]; then

@@ -15,10 +15,15 @@
 (define-record-type shard-ctx
   (fields (immutable handle shard-ctx-handle)
           (immutable cf shard-ctx-cf)
+          (immutable sync shard-ctx-sync)            ; fsync each write? (durable mode)
           (mutable clock shard-ctx-clock shard-ctx-clock-set!)))
 
-(define (make-ctx handle . cf)
-  (make-shard-ctx handle (if (null? cf) "default" (car cf)) 0))
+; (make-ctx handle [cf] [sync?])
+(define (make-ctx handle . opts)
+  (make-shard-ctx handle
+                  (if (and (pair? opts) (car opts)) (car opts) "default")
+                  (and (pair? opts) (pair? (cdr opts)) (cadr opts))
+                  0))
 
 (define (ctx-clock-advance! ctx d)
   (shard-ctx-clock-set! ctx (+ (shard-ctx-clock ctx) d)))
@@ -26,9 +31,9 @@
 
 ; ---- raw store ops on this shard's CF ----
 
-(define (kv-get ctx k)        (store-get (shard-ctx-handle ctx) (shard-ctx-cf ctx) k))
-(define (kv-put! ctx k v)     (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) k v))
-(define (kv-del! ctx k)       (store-delete (shard-ctx-handle ctx) (shard-ctx-cf ctx) k))
+(define (kv-get ctx k)    (store-get (shard-ctx-handle ctx) (shard-ctx-cf ctx) k))
+(define (kv-put! ctx k v) (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) k v (shard-ctx-sync ctx)))
+(define (kv-del! ctx k)   (store-delete (shard-ctx-handle ctx) (shard-ctx-cf ctx) k (shard-ctx-sync ctx)))
 (define (kv-exists? ctx k)    (and (kv-get ctx k) #t))
 
 ; Prefix scan -> list of (fullkey . value) bytevector pairs, over a stable

@@ -20,6 +20,7 @@
 (define dbbase  (arg-after "--db" "/tmp/crab-cache"))
 (define host    (arg-after "--host" "127.0.0.1"))
 (define nshards (string->number (arg-after "--shards" "3")))
+(define durable (string=? (arg-after "--durable" "no") "yes"))  ; fsync each write
 (define node-name 'n)
 
 ; a 40-hex-char node id derived from the node name (Redis-cluster shaped)
@@ -58,7 +59,7 @@
       (begin
         (spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main
                       (number->string i) (list node-name) node-name
-                      (string-append dbbase "-shard" (number->string i)))
+                      (string-append dbbase "-shard" (number->string i)) durable)
         (loop (+ i 1)))))
 
 ; wait until every shard has published its pid (so routing always resolves)

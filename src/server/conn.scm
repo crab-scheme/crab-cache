@@ -42,6 +42,15 @@
   (let loop ((i 0) (acc '()))
     (if (>= i (cfg-nshards cfg)) (reverse acc) (loop (+ i 1) (cons (direct-local cfg i cmd) acc)))))
 
+; SAVE/BGSAVE: checkpoint every local shard's RocksDB (per-node snapshot).
+(define (save-all cfg)
+  (let loop ((i 0) (ok #t))
+    (if (>= i (cfg-nshards cfg))
+        (if ok (r-ok) (r-err "ERR background save failed"))
+        (let ((p (table-lookup 'cc-shard-pid (local-qk cfg i))))
+          (send p (list 'checkpoint (self)))
+          (loop (+ i 1) (and ok (eq? (reply-tag (raw-receive)) 'ok)))))))
+
 ; PUBLISH / PUBSUB go through the broker (synchronous ask).
 (define (pubsub-numsub broker chans)
   (let loop ((cs chans) (acc '()))
@@ -88,6 +97,7 @@
          (operands (cdr cmd)))
     (cond
       ((or (string=? name "PUBLISH") (string=? name "PUBSUB")) (pubsub-reply name operands cfg))
+      ((or (string=? name "SAVE") (string=? name "BGSAVE")) (save-all cfg))
       (else
        (let ((r (classify-route name operands (cfg-nshards cfg))))
          (cond

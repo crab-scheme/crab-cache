@@ -16,7 +16,7 @@
 (for-each
  (lambda (nd)
    (spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main
-                 "0" '(a b c) nd (string-append "/tmp/cc-sim-" (symbol->string nd) "-s0")))
+                 "0" '(a b c) nd (string-append "/tmp/cc-sim-" (symbol->string nd) "-s0") #f))
  '(a b c))
 (for-each
  (lambda (nd)

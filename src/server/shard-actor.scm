@@ -57,11 +57,12 @@
      "LPUSH" "RPUSH" "LPUSHX" "RPUSHX" "LPOP" "RPOP" "LSET" "LREM" "LTRIM"
      "SADD" "SREM" "SPOP" "ZADD" "ZREM" "ZINCRBY" "FLUSHALL" "FLUSHDB")))
 
-(define (shard-main shard-key voters node-name db-path)
+(define (shard-main shard-key voters node-name db-path sync?)
   (let* ((handle  (store-open db-path))
-         (ctx     (make-ctx handle))
+         (ctx     (make-ctx handle "default" sync?))
          (pending (make-eqv-hashtable))            ; log-index -> conn-pid
          (acc     '())                             ; replies, newest-first (apply order)
+         (snap-n  0)                               ; checkpoint counter (unique dirs)
          (solo    (null? (cdr voters)))            ; 1-voter group?
          ; Staggered election timeout, ROTATED by shard so leadership spreads:
          ; for shard S the voter at index S has the shortest timeout and tends
@@ -146,6 +147,15 @@
             ;; (DBSIZE/FLUSHALL/KEYS are per-node in cluster mode)
             ((eq? (car m) 'direct)
              (send (cadr m) (shard-dispatch ctx (caddr m)))
+             (loop st leader elapsed))
+
+            ;; ---- SAVE: snapshot this shard's RocksDB via a checkpoint ----
+            ((eq? (car m) 'checkpoint)
+             (set! snap-n (+ snap-n 1))
+             (send (cadr m)
+                   (guard (e (#t (r-err "ERR checkpoint failed")))
+                     (store-checkpoint handle (string-append db-path "-snap" (number->string snap-n)))
+                     (r-ok)))
              (loop st leader elapsed))
 
             ;; ---- local client command: (conn-pid . cmd) ----

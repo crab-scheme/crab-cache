@@ -31,6 +31,7 @@
 (define me      (string->symbol (arg-after "--node" "a")))
 (define nshards (string->number (arg-after "--shards" "3")))
 (define dbbase  (arg-after "--db" "/tmp/cc-node"))
+(define durable (string=? (arg-after "--durable" "no") "yes"))
 (define cluster-spec (arg-after "--cluster" "a:127.0.0.1:7001:6001"))
 
 ; parse "name:host:raftport:clientport,..." -> list of (name host raftport clientport)
@@ -68,10 +69,13 @@
                            ((sym>? (car ns) me) (loop (cdr ns) (cons (car ns) acc)))
                            (else (loop (cdr ns) acc)))))
 (define (try-connect addr) (guard (e (#t #f)) (node-connect (symbol->string me) addr) #t))
+; On a fresh start the dial-higher-named handshakes form the mesh; on a
+; RESTART, peers re-dial us via their peer-poller heal, so we just wait for the
+; full peer count (be patient — the healing peer may be a tick or two away).
 (let mesh ((tries 0))
   (for-each (lambda (nm) (try-connect (raft-addr nm))) dial-peers)
   (cond ((>= (node-peer-count (symbol->string me)) (- (length nodes) 1)) #t)
-        ((> tries 2000000) (error "cluster: mesh did not form"))
+        ((> tries 200000000) (error "cluster: mesh did not form"))
         (else (mesh (+ tries 1)))))
 (display "node ") (display me) (display ": mesh up (")
 (display (node-peer-count (symbol->string me))) (display " peers)") (newline)
@@ -82,13 +86,15 @@
       (begin
         (spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main
                       (number->string i) all-names me
-                      (string-append dbbase "-shard" (number->string i)))
+                      (string-append dbbase "-shard" (number->string i)) durable)
         (loop (+ i 1)))))
 
 ; shard-key list for the poller
 (define shard-keys (let loop ((i 0) (acc '()))
                      (if (>= i nshards) (reverse acc) (loop (+ i 1) (cons (number->string i) acc)))))
-(spawn-source "(include \"src/server/peer-poller.scm\")" 'peer-poller me shard-keys 120)
+(define dial-addrs (map raft-addr dial-peers))
+(spawn-source "(include \"src/server/peer-poller.scm\")" 'peer-poller
+              me shard-keys 120 dial-addrs (- (length nodes) 1))
 
 ; pub/sub broker: fans PUBLISH out to peer brokers over node-send (the
 ; peer-poller delivers inbound broker-publish frames to it).

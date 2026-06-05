@@ -9,9 +9,19 @@
 ;   SHARD-KEYS : list of shard-key strings whose replicas live on this node
 ;   TICK-EVERY : emit a tick after this many idle poll iterations
 
-(define (peer-poller node-name shard-keys tick-every)
+; dial-addrs : raft addresses of higher-named peers to (re)dial
+; target     : expected peer count (= #nodes - 1); when we have fewer, a peer
+;              has gone (or a restarted peer is coming back) so we re-dial,
+;              healing the mesh. node-connect is keyed by peer name, so
+;              re-dialing a live peer is a harmless replace.
+(define (peer-poller node-name shard-keys tick-every dial-addrs target)
   (define (local-pid sk)
     (table-lookup 'cc-shard-pid (string-append (symbol->string node-name) ":" sk)))
+  (define (heal!)
+    (node-detect-disconnects (symbol->string node-name))   ; prune dead peers first
+    (if (< (node-peer-count (symbol->string node-name)) target)
+        (for-each (lambda (a) (guard (e (#t #f)) (node-connect (symbol->string node-name) a)))
+                  dial-addrs)))
   ; route an inbound frame: a Raft RPC to its local shard replica, or a
   ; cross-node PUBLISH to the local broker.
   (define (route! frame)
@@ -30,6 +40,6 @@
     (let ((msgs (node-poll (symbol->string node-name))))
       (for-each route! msgs)
       (cond
-        ((>= i tick-every) (tick-all!) (loop 0))
+        ((>= i tick-every) (tick-all!) (heal!) (loop 0))
         ((null? msgs) (yield) (loop (+ i 1)))
         (else (loop (+ i 1)))))))

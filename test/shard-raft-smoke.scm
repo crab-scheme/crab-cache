@@ -5,7 +5,7 @@
 (make-table 'cc-shard-role "set")
 (make-table 'cc-test "set")
 
-(spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main "0" '(n) 'n "/tmp/cc-shard0-db")
+(spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main "0" '(n) 'n "/tmp/cc-shard0-db" #f)
 
 (define (await tbl key)
   (let loop ((i 0))
