@@ -6,9 +6,37 @@ Sharded multi-Raft consensus, RocksDB-durable on every node, speaking the Redis
 RESP wire protocol so stock `redis-benchmark` / `memtier_benchmark` can drive it
 head-to-head against Redis itself.
 
-> **Status: 🚧 in active development.** The spec is complete (`spec/`); the
-> implementation is gated on the `cs-consensus` crate landing in the language
-> runtime ([crabscheme#114](https://github.com/crab-scheme/crab-scheme/pull/114)).
+> **Status: ✅ complete (Phases 0–10).** Single-node and multi-node clusters run;
+> `redis-cli` / `redis-benchmark` drive it unmodified. Failover (AS-3),
+> crash-recovery (AS-4), restart-rejoin, pub/sub, and a linearizability check
+> under failover all pass. Honest head-to-head numbers vs Redis are in
+> [`docs/measurements/`](docs/measurements/2026-06-05-crab-cache-vs-redis.md);
+> the effectiveness argument is in
+> [`docs/milestones/crab-cache-exit.md`](docs/milestones/crab-cache-exit.md).
+>
+> **Headline:** the cache is **~3,100 lines of CrabScheme** over an **~870-line
+> RocksDB FFI binding** (the only net-new Rust with no cache semantics), and at
+> **matched full durability it's on par with Redis on writes** (SET 1.0×, INCR 1.1×).
+
+### Run it
+
+```sh
+# build the runtime once (RocksDB-backed), in the crabscheme repo:
+cargo build -p cs-cli --features stdlib-store --release
+CC=…/crabscheme/target/release/crabscheme
+
+# single node, 3 shards
+$CC run src/node.scm -- --port 6400 --db /tmp/cc --shards 3
+redis-cli -p 6400 set foo bar && redis-cli -p 6400 get foo
+
+# clusters + the gates
+bash bench/cluster.sh failover      # AS-3: kill leader, no acked-write loss
+bash bench/cluster.sh rejoin        # downed node restarts + converges
+bash bench/cluster.sh pubsub        # cross-node pub/sub
+bash bench/crash-recovery.sh        # AS-4: kill -9, all acked SETs survive
+bash bench/linearizability.sh       # linearizable counter under failover
+bash bench/vs-redis.sh              # head-to-head throughput vs Redis
+```
 
 ---
 

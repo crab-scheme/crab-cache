@@ -1,5 +1,14 @@
 # crab-cache — Tasks & build plan
 
+> **STATUS: ✅ COMPLETE — all phases (0–10) shipped.** Every DoD gate passed:
+> Phase 3 306-check semantics, AS-1 RESP conformance, AS-3 failover (no acked-write
+> loss), AS-4 crash-recovery, restart-rejoin, cross-node pub/sub, and a passing
+> linearizability check under failover. Head-to-head numbers + effectiveness
+> argument: `docs/measurements/2026-06-05-crab-cache-vs-redis.md` and
+> `docs/milestones/crab-cache-exit.md`. Deferred hardening (multi-voter Raft-log
+> snapshots, atomic applied-index for non-idempotent replay) is noted in the exit
+> report.
+
 > Phased, verifiable work breakdown. Each task has an explicit **verify** gate
 > (per the "goal-driven execution" rule). The right column assigns a **model
 > tier** for the multi-agent build team. Read `requirements.md` + `design.md` first.
