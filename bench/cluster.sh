@@ -58,36 +58,38 @@ echo
 
 if [ "${1:-}" = "failover" ]; then
   echo
-  echo "== failover: write, kill the leader of foo's shard, recover, verify no loss =="
-  redis-cli -c -p 6001 set durable-key survives-failover >/dev/null 2>&1
-  # which node leads foo's slot? ask a; if MOVED, parse the host:port.
-  slotinfo=$(redis-cli -p 6001 set foo probe 2>&1)
+  echo "== failover: acked write on foo's shard, kill THAT shard's leader, verify =="
+  # foo lands on a specific shard; commit a value on it (acked => quorum-durable).
+  redis-cli -c -p 6001 set foo before-kill >/dev/null 2>&1
+  # find foo's current leader node (the SET above followed MOVED there).
+  slotinfo=$(redis-cli -p 6001 set foo before-kill 2>&1)
   leadhost=6001
-  case "$slotinfo" in
-    MOVED*) leadhost=$(echo "$slotinfo" | awk '{print $3}' | cut -d: -f2);;
-  esac
-  echo "  foo-shard leader client port = $leadhost"
-  # map client port -> node, kill it
+  case "$slotinfo" in MOVED*) leadhost=$(echo "$slotinfo" | awk '{print $3}' | cut -d: -f2);; esac
   for n in a b c; do [ "${CPORT[$n]}" = "$leadhost" ] && killn=$n; done
-  echo "  killing node $killn (leader)"
+  echo "  foo-shard leader = node $killn ($leadhost); killing it"
   kill "${PID[$killn]}" 2>/dev/null; PID[$killn]=""
-  # the other two must re-elect; retry writes until one succeeds
   others=$(for n in a b c; do [ "$n" != "$killn" ] && echo "${CPORT[$n]}"; done)
+  # 1) the pre-kill acked write must still be readable on the surviving quorum
+  surv=""
+  for _ in $(seq 1 80); do
+    for p in $others; do
+      v=$(redis-cli -c -p "$p" get foo 2>&1)
+      if [ "$v" = "before-kill" ]; then surv="before-kill"; break; fi
+    done
+    [ -n "$surv" ] && break
+    sleep 0.5
+  done
+  ck "no acked-write loss (same shard)" "before-kill" "$surv"
+  # 2) writes must resume under the new leader
   recovered=0
   for _ in $(seq 1 80); do
     for p in $others; do
-      r=$(redis-cli -c -p "$p" set foo after-failover 2>&1)
-      if [ "$r" = "OK" ]; then recovered=1; break; fi
+      [ "$(redis-cli -c -p "$p" set foo after-failover 2>&1)" = "OK" ] && { recovered=1; break; }
     done
     [ "$recovered" = 1 ] && break
     sleep 0.5
   done
-  echo "  recovered (new leader accepted a write) = $recovered"
-  # the pre-failover acked write must still be present (committed on quorum)
-  surv=""
-  for p in $others; do v=$(redis-cli -c -p "$p" get durable-key 2>&1); [ "$v" = "survives-failover" ] && surv=$v; done
-  ck "no acked-write loss" "survives-failover" "$surv"
-  ck "writes resume"       "1"                 "$recovered"
+  ck "writes resume on new leader" "1" "$recovered"
 fi
 
 echo
