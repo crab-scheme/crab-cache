@@ -1,0 +1,27 @@
+# Rust build glue (if any)
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Native plugin artifacts
+*.so
+*.dylib
+*.dll
+
+# RocksDB data dirs created at runtime
+/data/
+**/rocksdb/
+*.sst
+*.log
+LOG
+LOG.old.*
+
+# Benchmark outputs (committed selectively under docs/measurements)
+/bench/results/
+/bench/tmp/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
