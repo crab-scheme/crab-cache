@@ -47,7 +47,7 @@
                             ((< (car ps) n) (loop (cdr ps) (cons (list-ref operands (car ps)) acc)))
                             (else (loop (cdr ps) acc))))))
          (if (null? keys)
-             'any                            ; keyed command given no key -> let shard 0 arity-err
+             0                               ; keyed command given no key -> shard 0 arity-errs
              (let ((slots (map key-slot keys)))
                (if (all-equal? slots)
                    (slot->shard (car slots) nshards)

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# bench/cluster.sh — launch a 3-node crab-cache cluster over real TCP and
+# exercise cross-node routing (MOVED) + replication. With `failover` as $1,
+# also kills a shard leader mid-run and checks recovery + no acked-write loss.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${CRABSCHEME:-/Users/ztaylor/repos/workspaces/crabscheme/target/release/crabscheme}"
+SPEC="a:127.0.0.1:7001:6001,b:127.0.0.1:7002:6002,c:127.0.0.1:7003:6003"
+DB="$(mktemp -d "${TMPDIR:-/tmp}/cc-cluster.XXXXXX")"
+declare -A CPORT=([a]=6001 [b]=6002 [c]=6003)
+declare -A PID
+
+cleanup(){ for n in a b c; do [ -n "${PID[$n]:-}" ] && kill "${PID[$n]}" 2>/dev/null; done; rm -rf "$DB"; }
+trap cleanup EXIT
+cd "$ROOT"
+
+echo "== launching 3-node cluster =="
+for n in a b c; do
+  CRABSCHEME_ACTOR_LOCAL_WORKERS=60 "$BIN" run src/node-cluster.scm -- \
+      --node "$n" --shards 3 --db "$DB/$n" --cluster "$SPEC" >"$DB/$n.log" 2>&1 &
+  PID[$n]=$!
+done
+
+# wait for every client port to answer PING
+for n in a b c; do
+  ok=0
+  for _ in $(seq 1 100); do
+    redis-cli -p "${CPORT[$n]}" ping 2>/dev/null | grep -q PONG && { ok=1; break; }
+    sleep 0.25
+  done
+  [ "$ok" = 1 ] || { echo "node $n never came up"; echo "--- $n log ---"; cat "$DB/$n.log"; exit 1; }
+  echo "  node $n up on ${CPORT[$n]}"
+done
+
+echo "== MOVED routing (plain client hits a node; non-led shards redirect) =="
+# Show a MOVED for a key whichever node we ask that doesn't lead its shard.
+for k in foo bar user1000 counter; do
+  resp=$(redis-cli -p 6001 set "$k" "v-$k" 2>&1)
+  echo "  set $k @a -> $resp"
+done
+
+echo "== functional via redis-cli -c (follows MOVED across the cluster) =="
+fails=0
+ck(){ if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: want [$2] got [$3]"; fails=$((fails+1)); fi; }
+ck "set foo"   "OK"   "$(redis-cli -c -p 6001 set foo bar 2>&1)"
+ck "get foo@a" "bar"  "$(redis-cli -c -p 6001 get foo 2>&1)"
+ck "get foo@b" "bar"  "$(redis-cli -c -p 6002 get foo 2>&1)"   # different entry node, same value
+ck "get foo@c" "bar"  "$(redis-cli -c -p 6003 get foo 2>&1)"
+redis-cli -c -p 6001 set counter 0 >/dev/null 2>&1
+redis-cli -c -p 6001 incr counter >/dev/null 2>&1
+ck "incr"      "2"    "$(redis-cli -c -p 6002 incr counter 2>&1)"
+redis-cli -c -p 6001 rpush mylist a b c >/dev/null 2>&1
+ck "lrange"    "a b c" "$(redis-cli -c -p 6003 lrange mylist 0 -1 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+
+echo
+[ "$fails" = 0 ] && echo "CLUSTER ROUTING: all passed" || echo "CLUSTER ROUTING FAILED: $fails"
+
+if [ "${1:-}" = "failover" ]; then
+  echo
+  echo "== failover: write, kill the leader of foo's shard, recover, verify no loss =="
+  redis-cli -c -p 6001 set durable-key survives-failover >/dev/null 2>&1
+  # which node leads foo's slot? ask a; if MOVED, parse the host:port.
+  slotinfo=$(redis-cli -p 6001 set foo probe 2>&1)
+  leadhost=6001
+  case "$slotinfo" in
+    MOVED*) leadhost=$(echo "$slotinfo" | awk '{print $3}' | cut -d: -f2);;
+  esac
+  echo "  foo-shard leader client port = $leadhost"
+  # map client port -> node, kill it
+  for n in a b c; do [ "${CPORT[$n]}" = "$leadhost" ] && killn=$n; done
+  echo "  killing node $killn (leader)"
+  kill "${PID[$killn]}" 2>/dev/null; PID[$killn]=""
+  # the other two must re-elect; retry writes until one succeeds
+  others=$(for n in a b c; do [ "$n" != "$killn" ] && echo "${CPORT[$n]}"; done)
+  recovered=0
+  for _ in $(seq 1 80); do
+    for p in $others; do
+      r=$(redis-cli -c -p "$p" set foo after-failover 2>&1)
+      if [ "$r" = "OK" ]; then recovered=1; break; fi
+    done
+    [ "$recovered" = 1 ] && break
+    sleep 0.5
+  done
+  echo "  recovered (new leader accepted a write) = $recovered"
+  # the pre-failover acked write must still be present (committed on quorum)
+  surv=""
+  for p in $others; do v=$(redis-cli -c -p "$p" get durable-key 2>&1); [ "$v" = "survives-failover" ] && surv=$v; done
+  ck "no acked-write loss" "survives-failover" "$surv"
+  ck "writes resume"       "1"                 "$recovered"
+fi
+
+echo
+[ "$fails" = 0 ] && echo "DONE ok" || echo "DONE with $fails failures"
+exit "$fails"

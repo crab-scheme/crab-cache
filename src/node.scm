@@ -34,6 +34,8 @@
 
 (make-table 'cc-shard-pid "set")
 (make-table 'cc-shard-role "set")
+(make-table 'cc-shard-leader "set")
+(make-table 'cc-shard-commit "set")
 (make-table 'cc-config "set")
 
 ; topology ranges: (start end host port node-id) per shard (all this node)
@@ -42,7 +44,9 @@
     (if (>= i nshards) (reverse acc)
         (let ((rng (shard-slot-range i nshards)))
           (loop (+ i 1) (cons (list (car rng) (cdr rng) host port node-id) acc))))))
-(table-insert! 'cc-config "cfg" (list host port nshards node-id ranges))
+; single node => it leads every shard; nothing is ever MOVED.
+(define addrs (list (cons node-name (string-append host ":" (number->string port)))))
+(table-insert! 'cc-config "cfg" (list host port nshards node-id ranges node-name addrs))
 
 ; spawn one shard-replica per shard (own DB dir, 1-voter group = this node)
 (let loop ((i 0))
@@ -54,9 +58,10 @@
         (loop (+ i 1)))))
 
 ; wait until every shard has published its pid (so routing always resolves)
+(define (shard-qk i) (string-append (symbol->string node-name) ":" (number->string i)))
 (let spin ((i 0))
   (cond ((>= i nshards) #t)
-        ((table-lookup 'cc-shard-pid (number->string i)) (spin (+ i 1)))
+        ((table-lookup 'cc-shard-pid (shard-qk i)) (spin (+ i 1)))
         (else (spin 0))))
 
 (define listener (tcp-listen host port))
