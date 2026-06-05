@@ -1,53 +1,66 @@
-; server/conn.scm — the per-connection actor body.
+; server/conn.scm — the per-connection actor body (Phase 5: slot-routed).
 ;
-; One spawn-source actor (its OWN OS thread) per accepted client socket, so
-; the blocking tcp-recv that waits for the next request only parks THIS
-; connection's thread — never a shared worker (design §10 + the net
-; clone-then-unlock fix means concurrent connections don't serialize).
+; One spawn-source actor (own OS thread) per accepted socket. It decodes RESP,
+; routes each command by CRC16 keyslot to the owning shard's replica actor
+; (via the process-global shard-pid table), forwards it, and writes the
+; batched reply. Keyless/admin commands go to shard 0; DBSIZE/FLUSHALL/KEYS
+; fan out to every shard and aggregate; CLUSTER is answered from topology;
+; multi-key commands spanning slots get -CROSSSLOT.
 ;
-; It reads RESP bytes, decodes complete commands (holding any partial tail
-; for the next read), forwards each command to the shard-owner actor, and
-; writes the batched replies back. Pure protocol glue — zero command
-; semantics (those live in the shard-owner).
-;
-; Loaded into a fresh per-actor runtime via:  (spawn-source "(include …)" 'conn sock)
+; Loaded by spawn-source: (spawn-source "(include \"src/server/conn.scm\")" 'conn sock)
 
 (include "src/reply.scm")
-(include "src/encoding.scm")        ; subbv
+(include "src/encoding.scm")
 (include "src/resp.scm")
+(include "src/slotmap.scm")
+(include "src/router.scm")
+(include "src/commands/cluster.scm")
 
 (define RECV-MAX 65536)
 
-; Hand-rolled synchronous RPC to the shard-owner (the beam prelude's `call`
-; isn't auto-loaded): send (self . cmd), block for the single reply. The
-; conn-actor has exactly one request outstanding at a time, so the next
-; mailbox message is always this command's reply.
-(define (ask owner cmd)
-  (send owner (cons (self) cmd))
-  (raw-receive))
+(define (shard-pid i) (table-lookup 'cc-shard-pid (number->string i)))
+
+; synchronous RPC to a shard replica: send (self . cmd), block for the reply.
+(define (ask-shard i cmd)
+  (let ((p (shard-pid i)))
+    (send p (cons (self) cmd))
+    (raw-receive)))
+
+(define (fan-out-all cmd nshards)
+  (let loop ((i 0) (acc '()))
+    (if (>= i nshards) (reverse acc) (loop (+ i 1) (cons (ask-shard i cmd) acc)))))
+
+; route one decoded command to a reply
+(define (route-reply cmd cfg)
+  (let* ((name (string-upcase (utf8->string (car cmd))))  ; clients send any case
+         (operands (cdr cmd))
+         (nshards (cfg-nshards cfg))
+         (r (classify-route name operands nshards)))
+    (cond
+      ((eq? r 'crossslot)
+       (r-err "CROSSSLOT Keys in request don't hash to the same slot"))
+      ((eq? r 'cluster) (cluster-reply operands cfg))
+      ((eq? r 'all) (aggregate-replies name (fan-out-all cmd nshards)))
+      ((eq? r 'any) (ask-shard 0 cmd))
+      (else (ask-shard r cmd)))))
 
 (define (conn sock)
-  (let ((owner (table-lookup 'crabcache "owner")))
+  (let ((cfg (table-lookup 'cc-config "cfg")))     ; (host port nshards id ranges)
     (let loop ((buf (make-bytevector 0 0)))
       (let ((chunk (tcp-recv sock RECV-MAX)))
         (if (= (bytevector-length chunk) 0)
-            (tcp-close sock)                         ; clean EOF: client gone
+            (tcp-close sock)
             (let* ((data   (bytevector-append buf chunk))
                    (parsed (resp-parse data))
                    (cmds   (car parsed))
                    (rem    (cdr parsed))
-                   (result (serve-commands owner cmds)))
-              ; result = (out-bytes . keep-open?)
+                   (result (serve-commands cmds cfg)))
               (if (> (bytevector-length (car result)) 0)
                   (tcp-send sock (car result)))
-              (if (cdr result)
-                  (loop rem)
-                  (tcp-close sock))))))))            ; protocol error -> close
+              (if (cdr result) (loop rem) (tcp-close sock))))))))
 
-; Build the concatenated reply bytes for a batch of decoded commands. A
-; protocol-error frame is answered then the connection is closed (Redis
-; behavior). Returns (out-bytevector . keep-open?).
-(define (serve-commands owner cmds)
+; (out-bytevector . keep-open?)
+(define (serve-commands cmds cfg)
   (let loop ((cs cmds) (out (make-bytevector 0 0)))
     (if (null? cs)
         (cons out #t)
@@ -55,4 +68,4 @@
           (if (and (pair? cmd) (eq? (car cmd) 'protocol-error))
               (cons (bytevector-append out (resp-encode (r-err (cadr cmd)))) #f)
               (loop (cdr cs)
-                    (bytevector-append out (resp-encode (ask owner cmd)))))))))
+                    (bytevector-append out (resp-encode (route-reply cmd cfg)))))))))
