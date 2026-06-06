@@ -57,7 +57,11 @@
 (let loop ((i 0))
   (if (< i nshards)
       (begin
-        (spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main
+        ; Shards own a dedicated OS thread: their (receive) loop does blocking
+        ; RocksDB fsync (durable regime), which must not freeze a shared green
+        ; worker — concurrent fsync across threads is what carries write
+        ; throughput. (green-threads INV-2.)
+        (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
                       (number->string i) (list node-name) node-name
                       (string-append dbbase "-shard" (number->string i)) durable)
         (loop (+ i 1)))))
