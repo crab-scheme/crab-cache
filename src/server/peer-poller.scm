@@ -8,10 +8,15 @@
 ;                 NODE-NAME SHARD-KEYS TICK-EVERY)
 ;   SHARD-KEYS : list of shard-key strings whose replicas live on this node
 ;   TICK-EVERY : emit a tick after this many idle poll iterations. NOTE: the
-;                idle branch uses (yield), not (sleep-ms): yield cooperatively
-;                releases this shared LocalSet worker to the co-located shard
-;                replicas, whereas sleep-ms (thread::sleep) would block the
-;                worker and starve them, stalling replication.
+;                idle branch must stay (yield), NOT (sleep-ms). This loop is
+;                two things at once: the Raft tick clock (ticks pace
+;                heartbeats/elections, counted in idle iterations) AND this
+;                node's sole inbound-frame drainer. Any real sleep slows tick
+;                emission + frame delivery, stretching the propose->replicate
+;                window — measured ~2/3 failover runs then lose an acked write.
+;                (This actor is a dedicated-thread spawn-source actor, so it's
+;                a protocol-timing issue, not worker starvation; and sleep-ms
+;                now hard-errors on a shared LocalSet worker anyway.)
 
 ; dial-addrs : raft addresses of higher-named peers to (re)dial
 ; target     : expected peer count (= #nodes - 1); when we have fewer, a peer
