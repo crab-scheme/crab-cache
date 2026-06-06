@@ -84,7 +84,9 @@
 (let loop ((i 0))
   (if (< i nshards)
       (begin
-        (spawn-source "(include \"src/server/shard-actor.scm\")" 'shard-main
+        ; Dedicated thread — blocking RocksDB fsync must not freeze a shared
+        ; green worker (green-threads INV-2).
+        (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
                       (number->string i) all-names me
                       (string-append dbbase "-shard" (number->string i)) durable)
         (loop (+ i 1)))))
@@ -93,7 +95,10 @@
 (define shard-keys (let loop ((i 0) (acc '()))
                      (if (>= i nshards) (reverse acc) (loop (+ i 1) (cons (number->string i) acc)))))
 (define dial-addrs (map raft-addr dial-peers))
-(spawn-source "(include \"src/server/peer-poller.scm\")" 'peer-poller
+; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;
+; cooperative parking on a shared worker would slow the protocol (green-threads
+; INV-3).
+(spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
               me shard-keys 120 dial-addrs (- (length nodes) 1))
 
 ; pub/sub broker: fans PUBLISH out to peer brokers over node-send (the
