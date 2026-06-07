@@ -39,6 +39,11 @@
 (make-table 'cc-shard-commit "set")
 (make-table 'cc-broker "set")
 (make-table 'cc-config "set")
+; perf: in-memory read-serving map — persistent (no-TTL) string values keyed by
+; the raw key bytevector. Conn actors read it directly (no shard hop, no RocksDB,
+; no dir+value double-read). A pure cache: any miss falls back to the shard,
+; which reads RocksDB authoritatively and warms this map.
+(make-table 'cc-str "set")
 
 ; pub/sub broker (single node => no peers to fan out to)
 (spawn-source "(include \"src/server/pubsub.scm\")" 'broker-main node-name '())

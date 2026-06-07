@@ -15,7 +15,13 @@
 (define (str-get ctx key)
   (let ((e (key-entry ctx key)))
     (cond ((not e) #f)
-          ((char=? (car e) #\s) (cons (kv-get ctx (str-key key)) (cdr e)))
+          ((char=? (car e) #\s)
+           (let ((v (kv-get ctx (str-key key))))
+             ; perf #4: warm the in-memory serving map on a shard read so a cold
+             ; map (after recovery/failover) repopulates here. Persistent only —
+             ; TTL'd keys stay out so their reads keep routing to lazy-expiry.
+             (if (= (cdr e) 0) (table-insert! 'cc-str key v))
+             (cons v (cdr e))))
           (else 'wrong))))
 
 ; Write a string value with an explicit deadline (purging any prior
@@ -24,7 +30,13 @@
   (let ((t (key-type ctx key)))
     (if (and t (not (char=? t #\s))) (purge-key! ctx key)))
   (kv-put! ctx (str-key key) valbv)
-  (dir-set! ctx key #\s deadline))
+  (dir-set! ctx key #\s deadline)
+  ; perf #2/#4: keep the in-memory serving map coherent. A persistent string is
+  ; inserted (value held WITH its key, so reads need no separate dir lookup); a
+  ; TTL'd write is evicted so reads route to the shard's lazy-expiry path.
+  (if (= deadline 0)
+      (table-insert! 'cc-str key valbv)
+      (table-delete! 'cc-str key)))
 
 ; ---- SET key value [NX|XX] [EX s|PX ms|KEEPTTL] ----
 

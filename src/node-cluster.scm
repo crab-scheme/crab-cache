@@ -57,6 +57,10 @@
 (make-table 'cc-shard-commit "set")
 (make-table 'cc-broker "set")
 (make-table 'cc-config "set")
+; perf: in-memory read-serving map (see node.scm). Conn-local reads only ever
+; serve when THIS node leads the slot, so a follower's map is never read; the
+; leader maintains its own map via str-write!/purge-key!. Miss -> shard (warms).
+(make-table 'cc-str "set")
 
 ; ---- bring up the inter-node mesh ----
 (node-make (symbol->string me))

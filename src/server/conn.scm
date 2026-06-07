@@ -38,6 +38,24 @@
               (if addr (r-err (string-append "MOVED " (number->string (slot-of cmd)) " " addr))
                   (r-err "TRYAGAIN leader address unknown")))))))
 
+; perf #1/#2/#3/#4: serve GET from the in-memory map IN THIS (conn) actor — no
+; shard round-trip (#3), no RocksDB + no dir+value double-read (#2/#4), raw key
+; with no prefix bytevector (#1). Only when this node leads the slot AND the key
+; is a live persistent string (present in cc-str). Every miss falls through to
+; the shard, which reads RocksDB authoritatively and warms the map — so this is
+; a pure cache: correct across recovery/failover, and TTL'd keys (never in
+; cc-str) keep their lazy-expiry semantics via the shard path.
+(define (get-fast cfg s operands cmd)
+  (if (not (= (length operands) 1))
+      (route-to-shard cfg s cmd)                 ; arity error: let the handler emit it
+      (let ((leader (table-lookup 'cc-shard-leader (local-qk cfg s))))
+        (cond
+          ((not leader) (r-err "TRYAGAIN no leader for slot yet"))
+          ((eqv? leader (cfg-my-node cfg))
+           (let ((v (table-lookup 'cc-str (car operands))))
+             (if v (r-bulk v) (ask-local cfg s cmd))))   ; hit: conn-local; miss: shard (warms)
+          (else (route-to-shard cfg s cmd))))))          ; remote: -> MOVED
+
 (define (fan-out-direct cmd cfg)
   (let loop ((i 0) (acc '()))
     (if (>= i (cfg-nshards cfg)) (reverse acc) (loop (+ i 1) (cons (direct-local cfg i cmd) acc)))))
@@ -105,6 +123,7 @@
            ((eq? r 'cluster) (cluster-reply operands cfg))
            ((eq? r 'all) (aggregate-replies name (fan-out-direct cmd cfg)))
            ((eq? r 'any) (stateless-reply name operands))
+           ((string=? name "GET") (get-fast cfg r operands cmd))   ; conn-local in-memory read
            (else (route-to-shard cfg r cmd))))))))
 
 ; ---- subscriber mode ----
