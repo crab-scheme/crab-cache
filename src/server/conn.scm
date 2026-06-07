@@ -52,8 +52,10 @@
         (cond
           ((not leader) (r-err "TRYAGAIN no leader for slot yet"))
           ((eqv? leader (cfg-my-node cfg))
-           (let ((v (table-lookup 'cc-str (car operands))))
-             (if v (r-bulk v) (ask-local cfg s cmd))))   ; hit: conn-local; miss: shard (warms)
+           ; native lookup+encode: value bytes go straight from the table payload
+           ; into the RESP bulk frame (no deep-clone, no Scheme resp-encode).
+           (let ((enc (table-get-resp-bulk 'cc-str (car operands))))
+             (if enc (r-raw enc) (ask-local cfg s cmd))))   ; hit: conn-local native; miss: shard (warms)
           (else (route-to-shard cfg s cmd))))))          ; remote: -> MOVED
 
 (define (fan-out-direct cmd cfg)

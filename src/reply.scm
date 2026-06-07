@@ -28,6 +28,7 @@
 (define (r-nil)         (cons 'nil #f))
 (define (r-array lst)   (cons 'array lst))          ; lst : list of replies
 (define (r-nil-array)   (cons 'nil-array #f))
+(define (r-raw bytes)   (cons 'raw bytes))          ; bytes : already-RESP-encoded bytevector (passthrough)
 
 ; Convenience: a bulk reply from a Scheme string.
 (define (r-str s) (r-bulk (string->utf8 s)))

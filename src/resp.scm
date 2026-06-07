@@ -143,6 +143,7 @@
                                       bv crlf-bv)))
     ((nil)       (string->utf8 "$-1\r\n"))
     ((nil-array) (string->utf8 "*-1\r\n"))
+    ((raw)       (reply-val r))   ; already-encoded bytes (native GET fast path) — passthrough
     ((array)     (let ((elems (reply-val r)))
                    (let loop ((e elems) (acc (bytevector-append
                                               (string->utf8 "*") (num->bv (length elems)) crlf-bv)))
