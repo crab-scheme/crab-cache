@@ -92,11 +92,49 @@
               (if conn (begin (send conn (car rs)) (hashtable-delete! pending idx)))
               (loop (+ k 1) (cdr rs)))))
       (set! acc '()))
-    ; solo log compaction (RocksDB is the snapshot); no-op for multi-voter
+
+    ; ---- group-commit ack gate (durable mode) ----
+    ;
+    ; In durable mode a write's RocksDB ops land immediately (sync=#f) but the
+    ; fsync is amortised: replies are buffered and `flush-base` remembers the
+    ; `applied` value BEFORE the first deferred write, so one drain!(flush-base)
+    ; later acks the whole batch in index order. CRITICAL: a waiter is NEVER
+    ; acked until ctx-flush! (the single fsync) has returned for its write.
+    ; Cap the batch so a non-stop write stream still bounds ack latency/memory.
+    (define FLUSH-CAP 256)
+    ; fsync the batch, then ack every buffered waiter from `base`.
+    (define (flush-and-drain! base)
+      (ctx-flush! ctx)
+      (if base (drain! base) (set! acc '())))
+    ; Decide what to do after applying entries (`old` = applied-before):
+    ;   leader + durable + writes buffered -> defer (return earliest flush-base),
+    ;                                or flush+ack now if the batch hit FLUSH-CAP;
+    ;   else (follower, relaxed, or nothing written) -> ack now (drain inline,
+    ;        exactly as before — a follower has no client waiters in `pending`,
+    ;        so this is a no-op that just resets `acc`; its writes are still in
+    ;        RocksDB (sync=#f) and get fsync'd on the next tick).
+    ; Only the leader holds client waiters, so only it group-commits; this keeps
+    ; the follower catch-up path identical to the pre-change behavior.
+    ; Returns the new flush-base (#f = nothing deferred).
+    (define (settle! leader? old flush-base)
+      (cond
+        ((and leader? (ctx-dirty? ctx))
+         (let ((base (if flush-base flush-base old)))
+           (if (>= (ctx-dirty-count ctx) FLUSH-CAP)
+               (begin (flush-and-drain! base) #f)
+               base)))
+        (else (drain! old) flush-base)))
+    ; solo log compaction (RocksDB is the snapshot); no-op for multi-voter.
+    ; NEVER compact while acks are deferred: `pending` is keyed by absolute log
+    ; index and compaction resets the log to 0, which would collide the next
+    ; proposal's index with an undrained one. flush-base = #f means every
+    ; applied entry's ack has been drained, so compaction is safe then.
     (define (compact st)
       (if (and solo (= (raft-applied st) (log-len st)))
           (aset* st (list 'log '() 'commit 0 'applied 0))
           st))
+    (define (maybe-compact st flush-base)
+      (if flush-base st (compact st)))
     ; node-qualified table keys ("node:shard") so the in-process sim (all
     ; replicas in one process) doesn't collide; in production each node has its
     ; own process-global table and the node prefix is simply constant.
@@ -111,10 +149,21 @@
            (stI (if solo (car (raft-campaign st0)) st0))   ; solo self-elects now
            (ldr0 (if solo node-name #f)))
       (publish! stI ldr0)
-      (let loop ((st stI) (leader ldr0) (elapsed 0))
-        (let ((m (raw-receive)))
+      ; `flush-base` (#f = no deferred acks) carries the group-commit ack gate:
+      ; when set, durable writes are buffered awaiting their batch fsync. While
+      ; deferred, poll the mailbox non-blocking — an empty mailbox flushes the
+      ; batch (one fsync) and acks all waiters at once (opportunistic, lowest
+      ; latency under light load); a steady stream keeps batching until a tick
+      ; or FLUSH-CAP. Relaxed mode never sets flush-base, so it always blocks
+      ; and acks inline exactly as before.
+      (let loop ((st stI) (leader ldr0) (elapsed 0) (flush-base #f))
+        (let ((m (if flush-base (raw-receive 0) (raw-receive))))
           (cond
-            ((not (pair? m)) (loop st leader elapsed))
+            ;; mailbox empty while acks are pending -> flush the batch + ack now
+            ((eq? m '*timeout*)
+             (flush-and-drain! flush-base)
+             (loop (maybe-compact st #f) leader elapsed #f))
+            ((not (pair? m)) (loop st leader elapsed flush-base))
 
             ;; ---- Raft RPC from a peer ----
             ((eq? (car m) 'engine)
@@ -122,41 +171,59 @@
                     (old (raft-applied st))
                     (r (raft-step st from rpc)) (st2 (car r)))
                (emit! (cdr r))
-               (drain! old)
-               (let* ((ae? (eq? (car rpc) 'ae))
-                      (ldr (cond ((raft-leader? st2) node-name) (ae? from) (else leader)))
-                      (el  (if ae? 0 elapsed)))
-                 (publish! st2 ldr)
-                 (loop (compact st2) ldr el))))
+               ; defer (leader, has waiters) or ack inline (follower) the applied entries
+               (let ((nb (settle! (raft-leader? st2) old flush-base)))
+                 (let* ((ae? (eq? (car rpc) 'ae))
+                        (ldr (cond ((raft-leader? st2) node-name) (ae? from) (else leader)))
+                        (el  (if ae? 0 elapsed)))
+                   (publish! st2 ldr)
+                   (loop (maybe-compact st2 nb) ldr el nb)))))
 
             ;; ---- heartbeat / election tick ----
+            ;; Bound durable-write ack latency to one tick: fsync any buffered
+            ;; writes (leader batch AND a follower's applied-but-unsynced
+            ;; entries) and ack any pending batch before doing Raft tick work.
+            ;; flush-and-drain! is a no-op when nothing is dirty / deferred.
             ((eq? (car m) 'tick)
+             (flush-and-drain! flush-base)
              (cond
                ((raft-leader? st)
-                (let ((r (raft-tick st))) (emit! (cdr r)) (loop (car r) node-name 0)))
-               (solo (loop st leader elapsed))
+                (let ((r (raft-tick st)))
+                  (emit! (cdr r))
+                  ; safe to compact: we just flushed+drained (pending is empty)
+                  (loop (maybe-compact (car r) #f) node-name 0 #f)))
+               (solo (loop (maybe-compact st #f) leader elapsed #f))
                ((>= elapsed timeout)
                 (let* ((r (raft-campaign st)) (st2 (car r))
                        (ldr (if (raft-leader? st2) node-name #f)))
                   (emit! (cdr r))
                   (publish! st2 ldr)
-                  (loop st2 ldr 0)))
-               (else (loop st leader (+ elapsed 1)))))
+                  (loop st2 ldr 0 #f)))
+               (else (loop st leader (+ elapsed 1) #f))))
 
             ;; ---- per-node admin, served directly regardless of role ----
-            ;; (DBSIZE/FLUSHALL/KEYS are per-node in cluster mode)
+            ;; (DBSIZE/FLUSHALL/KEYS are per-node in cluster mode). FLUSHALL/
+            ;; FLUSHDB mutate, so dispatch first (it dirties on top of any
+            ;; pending batch), then ONE fsync makes both the batch and the
+            ;; admin write durable, drain the batch, and only then ack the
+            ;; admin caller. (Reply is a separate channel from `pending`.)
             ((eq? (car m) 'direct)
-             (send (cadr m) (shard-dispatch ctx (caddr m)))
-             (loop st leader elapsed))
+             (let ((reply (shard-dispatch ctx (caddr m))))
+               (flush-and-drain! flush-base)
+               (send (cadr m) reply)
+               (loop (maybe-compact st #f) leader elapsed #f)))
 
             ;; ---- SAVE: snapshot this shard's RocksDB via a checkpoint ----
+            ;; Flush + ack any pending batch first so the snapshot is taken on a
+            ;; durable, fsync'd state.
             ((eq? (car m) 'checkpoint)
+             (flush-and-drain! flush-base)
              (set! snap-n (+ snap-n 1))
              (send (cadr m)
                    (guard (e (#t (r-err "ERR checkpoint failed")))
                      (store-checkpoint handle (string-append db-path "-snap" (number->string snap-n)))
                      (r-ok)))
-             (loop st leader elapsed))
+             (loop (maybe-compact st #f) leader elapsed #f))
 
             ;; ---- local client command: (conn-pid . cmd) ----
             (else
@@ -164,15 +231,16 @@
                     (name (string-upcase (utf8->string (car cmd)))))
                (cond
                  ((not (raft-leader? st))
-                  (send conn (r-err "TRYAGAIN shard not leader")) (loop st leader elapsed))
+                  (send conn (r-err "TRYAGAIN shard not leader")) (loop st leader elapsed flush-base))
                  ((not (write-cmd? name))
                   ; read on the leader: serve straight from applied state
-                  (send conn (shard-dispatch ctx cmd)) (loop st leader elapsed))
+                  (send conn (shard-dispatch ctx cmd)) (loop st leader elapsed flush-base))
                  (else
                   (let ((old (raft-applied st)) (idx (+ 1 (log-len st))))
                     (hashtable-set! pending idx conn)
                     (let* ((r (raft-propose st cmd)) (st1 (car r)))
                       (emit! (cdr r))                 ; AE to followers (cluster) / none (solo)
-                      (let ((st2 (maybe-commit st1)))  ; solo commits now; cluster waits for AERs
-                        (drain! old)
-                        (loop (compact st2) node-name elapsed))))))))))))))
+                      (let* ((st2 (maybe-commit st1)) ; solo commits now; cluster waits for AERs
+                             ; this branch only runs on the leader -> #t
+                             (nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
+                        (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))
