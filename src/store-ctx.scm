@@ -90,7 +90,14 @@
 ; live, #f if absent (EXPIRE on a missing key is a no-op returning 0).
 (define (set-deadline! ctx ukey deadline)
   (let ((e (key-entry ctx ukey)))
-    (and e (begin (dir-set! ctx ukey (car e) deadline) #t))))
+    (and e (begin
+             (dir-set! ctx ukey (car e) deadline)
+             ; perf #4: a string gaining a TTL must leave the no-TTL serving map
+             ; so its reads route to the shard's lazy-expiry path (PERSIST, i.e.
+             ; deadline 0, re-warms lazily on the next shard read).
+             (if (and (char=? (car e) #\s) (not (= deadline 0)))
+                 (table-delete! 'cc-str ukey))
+             #t))))
 
 ; Type-guard for a write/read: returns
 ;   'ok       key is live and of the wanted type (or absent — caller creates)
@@ -130,6 +137,9 @@
              (del-each ctx (kv-scan ctx (zset-score-prefix ukey)))
              (kv-del! ctx (zset-meta-key ukey))))
           (kv-del! ctx (dir-key ukey))
+          ; perf #4: evict from the in-memory serving map (covers DEL, lazy +
+          ; active expiry, RENAME, and string->other-type overwrites).
+          (table-delete! 'cc-str ukey)
           #t))))
 
 ; ---- composite-type (hash/list/set/zset) lifecycle helpers ----
