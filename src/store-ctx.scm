@@ -13,18 +13,27 @@
 ; expiry actor. The clock is what TTL deadlines are compared against, so
 ; every replica expires a key at the same logical tick (DD-3).
 (define-record-type shard-ctx
-  ; accessors auto-derived: shard-ctx-handle/-cf/-sync/-clock, plus the
-  ; clock mutator set-shard-ctx-clock! (CrabScheme record-type shorthand).
+  ; accessors auto-derived: shard-ctx-handle/-cf/-sync/-clock/-dirty, plus the
+  ; clock + dirty mutators set-shard-ctx-clock!/set-shard-ctx-dirty!
+  ; (CrabScheme record-type shorthand).
   (fields (immutable handle)
           (immutable cf)
-          (immutable sync)            ; fsync each write? (durable mode)
-          (mutable clock)))
+          ; Durable mode? In durable mode writes are GROUP-COMMITTED: each
+          ; write goes to the WAL with sync=#f (no per-write fsync) and `dirty`
+          ; counts the writes accumulated since the last fsync; the shard actor
+          ; issues ONE fsync (ctx-flush!) per batch/tick and only then acks the
+          ; waiters. Relaxed mode (sync=#f) writes the same way but never
+          ; fsyncs and never defers an ack.
+          (immutable sync)
+          (mutable clock)
+          (mutable dirty)))           ; # of writes buffered since last fsync
 
 ; (make-ctx handle [cf] [sync?])
 (define (make-ctx handle . opts)
   (make-shard-ctx handle
                   (if (and (pair? opts) (car opts)) (car opts) "default")
                   (and (pair? opts) (pair? (cdr opts)) (cadr opts))
+                  0
                   0))
 
 (define (ctx-clock-advance! ctx d)
@@ -33,10 +42,39 @@
 
 ; ---- raw store ops on this shard's CF ----
 
+; Writes ALWAYS go to RocksDB immediately with sync=#f, so reads in the same
+; command (the directory, composite-type data) see them at once — read-your-
+; writes is preserved with zero overlay. In durable mode the per-write fsync is
+; deferred: `dirty` is bumped and the shard actor fsyncs the whole batch once
+; (ctx-flush!) BEFORE acking. In relaxed mode `dirty` is still bumped but the
+; actor never flushes/defers, so behavior is unchanged (no fsync, ack now).
+(define (ctx-mark-dirty! ctx)
+  (set-shard-ctx-dirty! ctx (+ (shard-ctx-dirty ctx) 1)))
+
 (define (kv-get ctx k)    (store-get (shard-ctx-handle ctx) (shard-ctx-cf ctx) k))
-(define (kv-put! ctx k v) (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) k v (shard-ctx-sync ctx)))
-(define (kv-del! ctx k)   (store-delete (shard-ctx-handle ctx) (shard-ctx-cf ctx) k (shard-ctx-sync ctx)))
+(define (kv-put! ctx k v)
+  (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) k v #f)
+  (ctx-mark-dirty! ctx))
+(define (kv-del! ctx k)
+  (store-delete (shard-ctx-handle ctx) (shard-ctx-cf ctx) k #f)
+  (ctx-mark-dirty! ctx))
 (define (kv-exists? ctx k)    (and (kv-get ctx k) #t))
+
+; ---- group-commit flush ----
+;
+; #t if durable mode has writes that have not yet been fsync'd. The shard actor
+; uses this to decide whether to defer acks and when a flush is owed.
+(define (ctx-dirty? ctx) (and (shard-ctx-sync ctx) (> (shard-ctx-dirty ctx) 0)))
+(define (ctx-dirty-count ctx) (shard-ctx-dirty ctx))
+
+; Issue ONE WAL fsync covering every write accumulated since the last flush,
+; then reset the dirty counter. After this returns, all those writes are
+; durable, so the actor may ack their waiters. No-op when nothing is buffered
+; or in relaxed mode (the counter is reset either way).
+(define (ctx-flush! ctx)
+  (if (ctx-dirty? ctx)
+      (store-flush-wal (shard-ctx-handle ctx) #t))
+  (set-shard-ctx-dirty! ctx 0))
 
 ; Prefix scan -> list of (fullkey . value) bytevector pairs, over a stable
 ; snapshot taken at iter time.
