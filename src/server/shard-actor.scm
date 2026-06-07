@@ -123,7 +123,15 @@
            (if (>= (ctx-dirty-count ctx) FLUSH-CAP)
                (begin (flush-and-drain! base) #f)
                base)))
-        (else (drain! old) flush-base)))
+        ; Not deferring: a follower / relaxed / nothing-written, OR a leader that
+        ; just stepped down with a batch still deferred. If a batch WAS deferred
+        ; (flush-base set), fsync + ack it at flush-base — NOT `old` (this step's
+        ; applied-before), which would mis-index the buffered replies and strand
+        ; the waiters (HOLE 2). Otherwise drain inline at `old`. Nothing is
+        ; deferred afterward, so return #f.
+        (else
+         (if flush-base (flush-and-drain! flush-base) (drain! old))
+         #f)))
     ; solo log compaction (RocksDB is the snapshot); no-op for multi-voter.
     ; NEVER compact while acks are deferred: `pending` is keyed by absolute log
     ; index and compaction resets the log to 0, which would collide the next
@@ -170,6 +178,13 @@
              (let* ((from (cadr m)) (rpc (caddr m))
                     (old (raft-applied st))
                     (r (raft-step st from rpc)) (st2 (car r)))
+               ; HOLE 1 fix: a FOLLOWER fsyncs its applied writes (one flush)
+               ; BEFORE emitting the AppendEntries reply. The AER success means
+               ; "durably stored", so the leader may commit+ack a client only
+               ; once a quorum has truly fsync'd. The leader itself keeps
+               ; deferring (group-commit) via settle! below. No-op on solo
+               ; (always leader) so the single-node fast path is unchanged.
+               (if (and (not (raft-leader? st2)) (ctx-dirty? ctx)) (ctx-flush! ctx))
                (emit! (cdr r))
                ; defer (leader, has waiters) or ack inline (follower) the applied entries
                (let ((nb (settle! (raft-leader? st2) old flush-base)))
