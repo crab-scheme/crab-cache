@@ -193,21 +193,38 @@
 (define (pair-cmd? c) (and (pair? c) (bytevector? (car c))))
 
 (define (conn sock)
-  (let ((cfg (table-lookup 'cc-config "cfg")))
+  (let* ((cfg (table-lookup 'cc-config "cfg"))
+         (node (cfg-my-node cfg))
+         (ns   (cfg-nshards cfg)))
     (let loop ((buf (make-bytevector 0 0)))
       (let ((chunk (tcp-recv sock RECV-MAX)))
         (if (= (bytevector-length chunk) 0)
             (tcp-close sock)
-            (let* ((data (bytevector-append buf chunk)) (parsed (resp-parse data))
-                   (cmds (car parsed)) (rem (cdr parsed)) (sp (first-sub-pos cmds)))
-              (if sp
-                  (let ((pre (take-n cmds sp)) (subc (drop-n cmds sp)))
-                    (let ((r (serve-commands pre cfg)))
-                      (if (> (bytevector-length (car r)) 0) (tcp-send sock (car r))))
-                    (subscriber-loop sock cfg (broker-pid cfg) subc rem))
-                  (let ((result (serve-commands cmds cfg)))
-                    (if (> (bytevector-length (car result)) 0) (tcp-send sock (car result)))
-                    (if (cdr result) (loop rem) (tcp-close sock))))))))))
+            (let* ((data (bytevector-append buf chunk))
+                   ; perf cc-5pw.3: serve the LEADING run of locally-led GET
+                   ; hits entirely in Rust (parse+lookup+frame, no Scheme
+                   ; resp-parse/route/encode). `served` = framed hit replies,
+                   ; `consumed` = bytes the native path handled. Everything
+                   ; else (SET / non-local / miss / SUBSCRIBE / inline /
+                   ; partial) flows through the existing interpreted path on
+                   ; the unconsumed tail, unchanged.
+                   (fg (conn-serve-gets data node ns))
+                   (served (car fg)) (consumed (cdr fg))
+                   (dlen (bytevector-length data)))
+              (if (> (bytevector-length served) 0) (tcp-send sock served))
+              (if (= consumed dlen)
+                  (loop (make-bytevector 0 0))
+                  (let* ((data (subbv data consumed dlen))
+                         (parsed (resp-parse data))
+                         (cmds (car parsed)) (rem (cdr parsed)) (sp (first-sub-pos cmds)))
+                    (if sp
+                        (let ((pre (take-n cmds sp)) (subc (drop-n cmds sp)))
+                          (let ((r (serve-commands pre cfg)))
+                            (if (> (bytevector-length (car r)) 0) (tcp-send sock (car r))))
+                          (subscriber-loop sock cfg (broker-pid cfg) subc rem))
+                        (let ((result (serve-commands cmds cfg)))
+                          (if (> (bytevector-length (car result)) 0) (tcp-send sock (car result)))
+                          (if (cdr result) (loop rem) (tcp-close sock))))))))))))
 
 (define (serve-commands cmds cfg)
   (let loop ((cs cmds) (out (make-bytevector 0 0)))
