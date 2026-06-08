@@ -170,7 +170,22 @@
             (begin (str-write! ctx (car o) (cadr o) 0)
                    (loop (cddr o)))))))
 
+; ---- CAS key old new : atomic compare-and-set (one Raft write entry, applied on
+; the leader — linearizable). Sets key=new iff its current value equals old;
+; returns 1 on success, 0 on mismatch or absent. Gives the cas-register workload a
+; real compare-and-set without needing WATCH/MULTI/EXEC.
+(define (cmd-cas ctx operands)
+  (if (not (= (length operands) 3))
+      (r-wrong-args "cas")
+      (let* ((key (car operands)) (old (cadr operands)) (new (caddr operands))
+             (g (str-get ctx key)))
+        (cond
+          ((eq? g 'wrong) (r-wrongtype))
+          ((and g (bytevector=? (car g) old)) (str-write! ctx key new (cdr g)) (r-int 1))
+          (else (r-int 0))))))
+
 (register-command! "SET" cmd-set)
+(register-command! "CAS" cmd-cas)
 (register-command! "SETNX" cmd-setnx)
 (register-command! "GET" cmd-get)
 (register-command! "GETSET" cmd-getset)

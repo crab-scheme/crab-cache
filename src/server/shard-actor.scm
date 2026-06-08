@@ -35,6 +35,8 @@
 (include "src/commands/set.scm")
 (include "src/commands/zset.scm")
 (include "src/commands/server.scm")
+(include "src/resp.scm")                  ; resp-parse: decode the EXEC-TXN blob
+(include "src/commands/transaction.scm")
 (include "src/raft.scm")
 
 (define (raft-applied st) (aget st 'applied))
@@ -51,11 +53,12 @@
 ; on the leader, and keeps reads out of the log).
 (define (write-cmd? name)
   (member-str? name
-   '("SET" "SETNX" "GETSET" "APPEND" "INCR" "DECR" "INCRBY" "DECRBY" "MSET"
+   '("SET" "SETNX" "GETSET" "APPEND" "INCR" "DECR" "INCRBY" "DECRBY" "MSET" "CAS"
      "DEL" "UNLINK" "EXPIRE" "PEXPIRE" "PERSIST" "RENAME" "TICK"
      "HSET" "HSETNX" "HMSET" "HDEL" "HINCRBY"
      "LPUSH" "RPUSH" "LPUSHX" "RPUSHX" "LPOP" "RPOP" "LSET" "LREM" "LTRIM"
-     "SADD" "SREM" "SPOP" "ZADD" "ZREM" "ZINCRBY" "FLUSHALL" "FLUSHDB")))
+     "SADD" "SREM" "SPOP" "ZADD" "ZREM" "ZINCRBY" "FLUSHALL" "FLUSHDB"
+     "EXEC-TXN")))
 
 (define (shard-main shard-key voters node-name db-path sync?)
   (let* ((handle  (store-open db-path))
