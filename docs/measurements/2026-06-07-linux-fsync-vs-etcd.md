@@ -1,5 +1,23 @@
 # crab-cache vs etcd vs Redis — real-fsync (Linux) measurements (2026-06-07)
 
+> **UPDATE (later the same day) — the two levers identified below were SHIPPED.**
+> Same host, same A/B method (one crabscheme binary, crab-cache main vs the perf
+> branch):
+>
+> | workload | before | after | vs peers |
+> |---|---|---|---|
+> | **Durable SET** (group-commit, PR crab-cache#6 / crabscheme#126) | ~688 rps (p50 74ms) | **~5,852 rps** (p50 7.6ms) | **~6× etcd** (956); ~3× behind Redis (~18k) — was ~34× behind |
+> | **GET @ -P1** (native fused GET, PR crab-cache#7 / crabscheme#127) | 41,468 rps | **121,139 rps** | ~1.8× behind Redis (214k) — was ~5.3× |
+> | **GET @ -P16** | 39,828 (flat) | **1,519,757 rps** | **beats Redis pipelined** |
+> | **GET @ -P32** | 27,905 | **2,840,909 rps** | — |
+>
+> Durable: a deferred-fsync group commit (one `store-flush-wal` per batch/tick).
+> GET: a native `conn-serve-gets` builtin that parses+slot-hashes+looks-up+frames
+> the leading run of locally-led GET hits in one Rust call. Crash-recovery (AS-4)
+> + cluster failover (AS-3, no acked-write loss) + conformance (AS-1, GET
+> value-correct) all PASS. **The tables below are the PRE-improvement baseline**
+> (the problem + the levers).
+
 This run **corrects the durable-write claim** in
 [2026-06-05-crab-cache-vs-redis.md](2026-06-05-crab-cache-vs-redis.md). That doc
 (measured on macOS) reported durable SET as **"1.0× — even"** with Redis. That was

@@ -1,5 +1,13 @@
 # crab-cache vs Redis — measurements (2026-06-05)
 
+> **⚠️ SUPERSEDED — read [2026-06-07-linux-fsync-vs-etcd.md](2026-06-07-linux-fsync-vs-etcd.md) instead.**
+> The "durable SET 1.0× — even with Redis" result below is a **macOS fsync
+> artifact** (`fsync()` isn't a true barrier on macOS; only `F_FULLFSYNC` is).
+> On a real-fsync host the durable picture differs, and crab-cache has since
+> gained **group-commit** (durable SET ~6× etcd, ~3× behind Redis) and a
+> **native fused GET** (121k rps @ -P1, beats Redis pipelined). This doc is kept
+> for the correctness/linearizability results only.
+
 crab-cache is a sharded, RocksDB-durable, Raft-replicated, RESP-compatible
 cache **written in CrabScheme**. These are fair head-to-head numbers against
 real Redis, plus the linearizability result under failover.

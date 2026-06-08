@@ -9,14 +9,18 @@ head-to-head against Redis itself.
 > **Status: ✅ complete (Phases 0–10).** Single-node and multi-node clusters run;
 > `redis-cli` / `redis-benchmark` drive it unmodified. Failover (AS-3),
 > crash-recovery (AS-4), restart-rejoin, pub/sub, and a linearizability check
-> under failover all pass. Honest head-to-head numbers vs Redis are in
-> [`docs/measurements/`](docs/measurements/2026-06-05-crab-cache-vs-redis.md);
+> under failover all pass. Honest head-to-head numbers (vs Redis **and etcd**, on
+> a real-fsync host) are in
+> [`docs/measurements/`](docs/measurements/2026-06-07-linux-fsync-vs-etcd.md);
 > the effectiveness argument is in
 > [`docs/milestones/crab-cache-exit.md`](docs/milestones/crab-cache-exit.md).
 >
 > **Headline:** the cache is **~3,100 lines of CrabScheme** over an **~870-line
-> RocksDB FFI binding** (the only net-new Rust with no cache semantics), and at
-> **matched full durability it's on par with Redis on writes** (SET 1.0×, INCR 1.1×).
+> RocksDB FFI binding** (the only net-new Rust with no cache semantics). On a
+> real-fsync host, after group-commit + a native fused GET path:
+> **durable SET ~5.9k rps — ~6× etcd, ~3× behind Redis** (was ~34× behind), and
+> **GET 121k rps @ -P1** (from ~5× behind toward parity) that **beats Redis when
+> pipelined** (~1.5M @ -P16) — a Raft+fsync cache in Scheme vs hand-tuned C.
 
 ### Run it
 
@@ -49,10 +53,12 @@ crab-cache is a **showcase for the CrabScheme language**. The thesis:
 > wire-compatible** distributed cache with a **small amount of Scheme**, and to do
 > so **competitively** with a mature C system.
 
-We are **not** trying to beat Redis on raw throughput — Redis is hand-tuned C.
-The proof is *correctness + durability + distribution + expressiveness at
-competitive (within-Nx) speed*, reported honestly with matched-durability
-benchmarks.
+We weren't out to beat Redis on raw throughput — Redis is hand-tuned C — yet
+after group-commit + a native fused GET, crab-cache **leads etcd ~6× on durable
+writes** and **beats Redis on pipelined GET** (~1.5M rps @ -P16), while staying
+within a small factor on single-op latency. The proof is *correctness + durability
++ distribution + expressiveness at competitive (and in places leading) speed*,
+reported honestly with matched-durability benchmarks.
 
 ## The one rule: the cache is CrabScheme, not Rust
 

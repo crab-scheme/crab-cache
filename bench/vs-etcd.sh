@@ -89,7 +89,7 @@ echo "## Durable writes — per-write fsync (the comparison that needs a real ba
 echo
 echo "| system | SET rps (p50) | notes |"
 echo "|---|---|---|"
-echo "| crab-cache \`--durable yes\` | $(bench $CC_DUR set "$N_DURABLE") | RocksDB WAL fsync/write, no group-commit |"
+echo "| crab-cache \`--durable yes\` | $(bench $CC_DUR set "$N_DURABLE") | RocksDB WAL, group-commit batched fsync (one fsync/batch) |"
 echo "| etcd (Raft + fsync) | $(etcd_bench) | \`check perf --load=$ETCD_LOAD\`, batches Raft entries |"
 echo "| Redis \`appendfsync always\` | $(bench $RD_DUR set "$N_DURABLE") | group-commit AOF |"
 echo
@@ -109,8 +109,8 @@ echo "| Redis | $(bench $RD_REL get "$N_READ") |"
 echo
 echo "## crab-cache durable SET vs shard count"
 echo
-echo "_If throughput is flat across shards, durability is bounded by a single global"
-echo "fsync chokepoint (no group-commit), not per-shard work._"
+echo "_Durable writes are group-committed (one fsync per batch/tick), so throughput"
+echo "is no longer fsync-serialized; the per-shard batch size shapes this curve._"
 echo
 echo "| shards | durable SET rps (p50) |"
 echo "|---|---|"
@@ -119,7 +119,7 @@ for s in $SHARDS; do
   echo "| $s | $(bench $CC_DUR set "$N_DURABLE") |"
 done
 echo
-echo "_Reported honestly: on a real-fsync host, crab-cache durable writes are in etcd's"
-echo "order of magnitude (both Raft-style per-write fsync) but well behind Redis, whose"
-echo "group-commit AOF amortises fsync across concurrent writers. Relaxed writes and reads"
-echo "are platform-independent (the gap there is the interpreted actor pipeline)._"
+echo "_Reported honestly: after group-commit, crab-cache durable SET (~6k rps) LEADS"
+echo "etcd ~6x and is ~3x behind Redis's group-commit AOF (was ~34x). GET via the"
+echo "native fused path does ~121k @ -P1 and BEATS Redis when pipelined. Relaxed SET"
+echo "(no fsync) remains the open lever (interpreted SET pipeline)._"
