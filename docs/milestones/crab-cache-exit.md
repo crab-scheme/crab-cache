@@ -99,14 +99,18 @@ no cache semantics whatsoever.**
 
 ## The honest perf verdict
 
-crab-cache does **not** beat Redis on raw throughput and was never meant to (NG2).
-The full numbers are in `docs/measurements/2026-06-05-crab-cache-vs-redis.md`:
+Updated after the 2026-06-07 perf work (real-fsync Linux; full numbers in
+`docs/measurements/2026-06-07-linux-fsync-vs-etcd.md`):
 
-- **Relaxed durability:** Redis is **16–28× faster** — Scheme interpreter + a
-  Raft round-trip per write vs. hand-optimised C from memory.
-- **Matched full durability (fsync per write):** **write throughput is on par
-  with Redis** — SET 1.0×, INCR 1.1×. When you actually pay for durability, the
-  fsync dominates and the language overhead disappears.
+- **Durable writes (fsync per write) — group-commit:** durable SET **~5.9k rps —
+  ~6× faster than etcd** (crab-cache's true Raft+fsync peer) and **~3× behind
+  Redis** (was ~34× behind). The earlier "on par with Redis, SET 1.0×" was a
+  macOS-`fsync` artifact, corrected on a host where `fsync` is a real barrier.
+- **Reads (GET) — native fused GET path:** **121k rps @ -P1** (was ~40k; ~1.8×
+  behind Redis, from ~5×) and **~1.5M @ -P16, beating Redis pipelined** — the
+  per-command interpreted ceiling is gone for GET.
+- **Relaxed writes (no fsync):** still Redis's domain (~20× faster) — the
+  interpreted SET pipeline is the remaining open lever.
 - **Correctness under failure holds:** linearizable counter under induced
   failover (zero lost/double-counted acked updates), no acked-write loss on
   leader kill, crash recovery, node rejoin-and-converge.
