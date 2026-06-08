@@ -61,7 +61,14 @@
   (list (cons 'id id) (cons 'peers (others id ids)) (cons 'all ids)
         (cons 'role 'follower) (cons 'term 0) (cons 'voted-for #f)
         (cons 'log '()) (cons 'commit 0) (cons 'applied 0) (cons 'votes '())
-        (cons 'next '()) (cons 'match '()) (cons 'apply apply-fn) (cons 'sm sm0)))
+        (cons 'next '()) (cons 'match '()) (cons 'apply apply-fn) (cons 'sm sm0)
+        ; `base` = highest log index covered by the persisted snapshot (RocksDB
+        ; state); the in-memory `log` list holds entries base+1.. only. `base` is
+        ; 0 in a fresh node and after no restart, so all helpers below reduce to
+        ; the original positional log. It advances on solo compaction and is
+        ; restored from RocksDB on restart so committed entries are never
+        ; re-applied (idempotent recovery/rejoin).
+        (cons 'base 0) (cons 'base-term 0)))
 
 (define (raft-id st)      (aget st 'id))
 (define (raft-role st)    (aget st 'role))
@@ -70,12 +77,16 @@
 (define (raft-commit st)  (aget st 'commit))
 (define (raft-sm st)      (aget st 'sm))
 
-; ---- log helpers (1-based) ----
-(define (log-len st) (length (aget st 'log)))
+; ---- log helpers (1-based ABSOLUTE indices; `log` list holds base+1..) ----
+(define (log-len st) (+ (aget st 'base) (length (aget st 'log))))
 (define (entry-term st i)
-  (if (<= i 0) 0 (car (list-ref (aget st 'log) (- i 1)))))
+  (let ((b (aget st 'base)))
+    (cond ((<= i 0) 0)
+          ((<= i b) (aget st 'base-term))                 ; at/below the snapshot base
+          (else (car (list-ref (aget st 'log) (- i b 1)))))))
 (define (last-log-term st) (entry-term st (log-len st)))
-(define (entries-from st i) (list-tail (aget st 'log) (- i 1)))   ; i in 1..len+1
+(define (entries-from st i)                               ; i in base+1..len+1
+  (list-tail (aget st 'log) (- i (aget st 'base) 1)))
 
 (define (majority st) (+ 1 (quotient (length (aget st 'all)) 2)))
 
@@ -112,7 +123,7 @@
   (let loop ((st st))
     (if (>= (aget st 'applied) (aget st 'commit)) st
         (let* ((i (+ 1 (aget st 'applied)))
-               (cmd (cdr (list-ref (aget st 'log) (- i 1))))
+               (cmd (cdr (list-ref (aget st 'log) (- i (aget st 'base) 1))))
                (sm2 ((aget st 'apply) (aget st 'sm) cmd)))
           (loop (aset* st (list 'applied i 'sm sm2)))))))
 
@@ -193,12 +204,13 @@
                (ok (and (<= pidx (log-len st)) (= (entry-term st pidx) pterm))))
           (if (not ok)
               (cons st (list (cons leader (list 'aer (aget st 'term) #f 0))))
-              (let* ((kept (take-n (aget st 'log) pidx))
+              (let* ((b (aget st 'base))
+                     (kept (take-n (aget st 'log) (- pidx b)))   ; keep base+1..pidx
                      (newlog (append kept entries))
                      (midx (+ pidx (length entries)))
                      (st (aset st 'log newlog))
                      (st (if (> lc (aget st 'commit))
-                             (apply-committed (aset st 'commit (min lc (length newlog))))
+                             (apply-committed (aset st 'commit (min lc (+ b (length newlog)))))
                              st)))
                 (cons st (list (cons leader (list 'aer (aget st 'term) #t midx))))))))))
 

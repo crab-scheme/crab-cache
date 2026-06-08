@@ -77,6 +77,12 @@
     (define (apply-fn sm cmd)
       (set! acc (cons (shard-dispatch ctx cmd) acc))
       (+ sm 1))
+    ; Persist the applied index (+ its term) into the SAME group-commit batch as
+    ; the entry's mutations, so a restart restores base/applied/commit and never
+    ; re-applies already-applied committed entries (idempotent recovery/rejoin —
+    ; fixes the non-idempotent INCR double-apply).
+    (define (persist-applied! st)
+      (ctx-save-applied! ctx (raft-applied st) (entry-term st (raft-applied st))))
     ; ship engine outputs (target-node . rpc) to peers over the node transport.
     ; A send to a DOWN peer must not crash us — Raft is lossy-tolerant and
     ; recovers the entry on the next heartbeat/AE, so swallow transport errors.
@@ -142,7 +148,12 @@
     ; applied entry's ack has been drained, so compaction is safe then.
     (define (compact st)
       (if (and solo (= (raft-applied st) (log-len st)))
-          (aset* st (list 'log '() 'commit 0 'applied 0))
+          ; snapshot the applied prefix into base (RocksDB IS the snapshot);
+          ; keep commit/applied so the index grows monotonically and survives
+          ; restart via the persisted applied-index.
+          (aset* st (list 'base (raft-applied st)
+                          'base-term (last-log-term st)
+                          'log '()))
           st))
     (define (maybe-compact st flush-base)
       (if flush-base st (compact st)))
@@ -156,7 +167,13 @@
       (table-insert! 'cc-shard-leader (qk) leader)
       (table-insert! 'cc-shard-commit (qk) (raft-commit st)))
 
-    (let* ((st0 (make-raft node-name voters apply-fn 0))
+    (let* ((loaded (ctx-load-applied ctx))                 ; (idx . term) from RocksDB
+           (p (car loaded)) (pt (cdr loaded))
+           (st0 (make-raft node-name voters apply-fn 0))
+           ; restart: RocksDB already reflects entries up to p, so start with the
+           ; log compacted to base=p (applied=commit=p). The log replays only
+           ; entries above p, so committed entries are never re-applied.
+           (st0 (if (> p 0) (aset* st0 (list 'base p 'base-term pt 'applied p 'commit p)) st0))
            (stI (if solo (car (raft-campaign st0)) st0))   ; solo self-elects now
            (ldr0 (if solo node-name #f)))
       (publish! stI ldr0)
@@ -181,6 +198,8 @@
              (let* ((from (cadr m)) (rpc (caddr m))
                     (old (raft-applied st))
                     (r (raft-step st from rpc)) (st2 (car r)))
+               ; record the new applied-index in the batch BEFORE the fsync below
+               (if (> (raft-applied st2) old) (persist-applied! st2))
                ; HOLE 1 fix: a FOLLOWER fsyncs its applied writes (one flush)
                ; BEFORE emitting the AppendEntries reply. The AER success means
                ; "durably stored", so the leader may commit+ack a client only
@@ -258,7 +277,8 @@
                     (hashtable-set! pending idx conn)
                     (let* ((r (raft-propose st cmd)) (st1 (car r)))
                       (emit! (cdr r))                 ; AE to followers (cluster) / none (solo)
-                      (let* ((st2 (maybe-commit st1)) ; solo commits now; cluster waits for AERs
-                             ; this branch only runs on the leader -> #t
-                             (nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
-                        (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))
+                      (let ((st2 (maybe-commit st1)))  ; solo commits now; cluster waits for AERs
+                        (if (> (raft-applied st2) old) (persist-applied! st2))
+                        ; this branch only runs on the leader -> #t
+                        (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
+                          (loop (maybe-compact st2 nb) node-name elapsed nb)))))))))))))))
