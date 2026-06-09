@@ -76,6 +76,30 @@
       (store-flush-wal (shard-ctx-handle ctx) #t))
   (set-shard-ctx-dirty! ctx 0))
 
+; ---- Raft applied-index persistence (idempotent recovery / rejoin) ----
+;
+; A restarted/rejoining replica must NOT re-apply committed entries its RocksDB
+; already reflects: re-applying a read-modify-write like INCR over the *current*
+; value diverges the counter (the non-idempotent-replay gap). We persist the
+; highest APPLIED Raft index (+ its term) under a reserved key, written sync=#f in
+; the SAME group-commit batch as that entry's mutations — so ONE fsync makes
+; (mutation, applied-index) durable together (crash between them is impossible on
+; recovery: either both WAL records are fsync'd or neither). On restart the shard
+; restores base/applied/commit from it (shard-actor.scm), so the log replays only
+; entries ABOVE the snapshot base. The reserved key starts with "_" — no user
+; key's stored form does (all are type-prefixed S:/T:/H:/L:/E:/Z:...), and the key
+; directory is scanned under "T:", so it never shows in DBSIZE/KEYS.
+(define RAFT-APPLIED-KEY (string->utf8 "_raft_applied"))
+(define (ctx-save-applied! ctx idx term)
+  (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) RAFT-APPLIED-KEY
+             (bytevector-append (u64->bytes idx) (u64->bytes term)) #f)
+  (ctx-mark-dirty! ctx))
+(define (ctx-load-applied ctx)              ; -> (idx . term); (0 . 0) if none
+  (let ((b (kv-get ctx RAFT-APPLIED-KEY)))
+    (if (and b (>= (bytevector-length b) 16))
+        (cons (bytes->u64 b 0) (bytes->u64 b 8))
+        (cons 0 0))))
+
 ; Prefix scan -> list of (fullkey . value) bytevector pairs, over a stable
 ; snapshot taken at iter time.
 (define (kv-scan ctx prefix)

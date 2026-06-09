@@ -32,6 +32,9 @@
 (define nshards (string->number (arg-after "--shards" "3")))
 (define dbbase  (arg-after "--db" "/tmp/cc-node"))
 (define durable (string=? (arg-after "--durable" "no") "yes"))
+; --consistency linearizable (default) = ReadIndex GET (cc-idc-safe); fast =
+; conn-local cc-str fast-path (faster, non-linearizable across elections).
+(define fast? (string=? (arg-after "--consistency" "linearizable") "fast"))
 (define cluster-spec (arg-after "--cluster" "a:127.0.0.1:7001:6001"))
 
 ; parse "name:host:raftport:clientport,..." -> list of (name host raftport clientport)
@@ -92,7 +95,7 @@
         ; green worker (green-threads INV-2).
         (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
                       (number->string i) all-names me
-                      (string-append dbbase "-shard" (number->string i)) durable)
+                      (string-append dbbase "-shard" (number->string i)) durable fast?)
         (loop (+ i 1)))))
 
 ; shard-key list for the poller
@@ -122,7 +125,7 @@
         (let ((rng (shard-slot-range i nshards)))
           (loop (+ i 1) (cons (list (car rng) (cdr rng) my-host my-cport node-id) acc))))))
 (define addrs (map (lambda (nm) (cons nm (client-addr nm))) all-names))
-(table-insert! 'cc-config "cfg" (list my-host my-cport nshards node-id ranges me addrs))
+(table-insert! 'cc-config "cfg" (list my-host my-cport nshards node-id ranges me addrs fast?))
 
 ; wait until this node has elected/learned a leader for every shard, so the
 ; first client never hits a "no leader yet" window.

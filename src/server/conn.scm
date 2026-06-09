@@ -19,6 +19,7 @@
 
 (define (cfg-my-node cfg) (list-ref cfg 5))
 (define (cfg-addrs cfg)   (list-ref cfg 6))
+(define (cfg-fast? cfg)   (list-ref cfg 7))   ; #t = fast cc-str GET; #f = ReadIndex (default)
 (define (node-addr nd addrs) (let ((p (assq nd addrs))) (and p (cdr p))))
 (define (local-qk cfg s) (string-append (symbol->string (cfg-my-node cfg)) ":" (number->string s)))
 (define (broker-pid cfg) (table-lookup 'cc-broker (symbol->string (cfg-my-node cfg))))
@@ -125,7 +126,12 @@
            ((eq? r 'cluster) (cluster-reply operands cfg))
            ((eq? r 'all) (aggregate-replies name (fan-out-direct cmd cfg)))
            ((eq? r 'any) (stateless-reply name operands))
-           ((string=? name "GET") (get-fast cfg r operands cmd))   ; conn-local in-memory read
+           ; GET: linearizable mode (default) routes to the shard for a ReadIndex read
+           ; (Raft §6.4 — the conn-local cc-str path can't confirm leadership, so a
+           ; deposed leader would serve stale values, cc-idc); fast mode serves the
+           ; cc-str cache locally (faster, non-linearizable across elections).
+           ((string=? name "GET")
+            (if (cfg-fast? cfg) (get-fast cfg r operands cmd) (route-to-shard cfg r cmd)))
            (else (route-to-shard cfg r cmd))))))))
 
 ; ---- subscriber mode ----
@@ -196,41 +202,121 @@
   (let* ((cfg (table-lookup 'cc-config "cfg"))
          (node (cfg-my-node cfg))
          (ns   (cfg-nshards cfg)))
-    (let loop ((buf (make-bytevector 0 0)))
+    ; `txn` carries per-connection MULTI state across reads: #f outside a
+    ; transaction, or (queued-rev . err?) between MULTI and EXEC/DISCARD.
+    (let loop ((buf (make-bytevector 0 0)) (txn #f))
       (let ((chunk (tcp-recv sock RECV-MAX)))
         (if (= (bytevector-length chunk) 0)
             (tcp-close sock)
             (let* ((data (bytevector-append buf chunk))
-                   ; perf cc-5pw.3: serve the LEADING run of locally-led GET
-                   ; hits entirely in Rust (parse+lookup+frame, no Scheme
-                   ; resp-parse/route/encode). `served` = framed hit replies,
-                   ; `consumed` = bytes the native path handled. Everything
-                   ; else (SET / non-local / miss / SUBSCRIBE / inline /
-                   ; partial) flows through the existing interpreted path on
-                   ; the unconsumed tail, unchanged.
-                   (fg (conn-serve-gets data node ns))
+                   ; Native leading-GET fast-path (conn-serve-gets): fast mode only
+                   ; (serves cc-str locally with no leadership confirmation — not
+                   ; linearizable across elections, cc-idc). In linearizable mode (or a
+                   ; MULTI) GET goes through the interpreted path -> ReadIndex shard read.
+                   (fg (if (and (not txn) (cfg-fast? cfg))
+                           (conn-serve-gets data node ns)
+                           (cons (make-bytevector 0 0) 0)))
                    (served (car fg)) (consumed (cdr fg))
                    (dlen (bytevector-length data)))
               (if (> (bytevector-length served) 0) (tcp-send sock served))
               (if (= consumed dlen)
-                  (loop (make-bytevector 0 0))
+                  (loop (make-bytevector 0 0) txn)
                   (let* ((data (subbv data consumed dlen))
                          (parsed (resp-parse data))
                          (cmds (car parsed)) (rem (cdr parsed)) (sp (first-sub-pos cmds)))
                     (if sp
                         (let ((pre (take-n cmds sp)) (subc (drop-n cmds sp)))
-                          (let ((r (serve-commands pre cfg)))
+                          (let ((r (serve-commands pre cfg txn)))
                             (if (> (bytevector-length (car r)) 0) (tcp-send sock (car r))))
                           (subscriber-loop sock cfg (broker-pid cfg) subc rem))
-                        (let ((result (serve-commands cmds cfg)))
+                        (let ((result (serve-commands cmds cfg txn)))
                           (if (> (bytevector-length (car result)) 0) (tcp-send sock (car result)))
-                          (if (cdr result) (loop rem) (tcp-close sock))))))))))))
+                          (if (cadr result) (loop rem (caddr result)) (tcp-close sock))))))))))))
 
-(define (serve-commands cmds cfg)
-  (let loop ((cs cmds) (out (make-bytevector 0 0)))
+; ---- transactions: MULTI / EXEC / DISCARD ----
+; Per-connection txn state is #f (no transaction) or (queued-rev . err?) while a
+; MULTI is open: queued-rev holds the queued commands newest-first; err? marks a
+; queue-time problem so EXEC aborts with EXECABORT (Redis semantics).
+
+; EXEC ships the queued commands to the shard as ONE flat RESP blob (a single
+; bytevector), NOT a list of command-lists: the Raft entry replicates over
+; node-send, which does not preserve nested lists, so a new leader would apply
+; corrupted data. resp-parse rebuilds the sub-commands at apply (transaction.scm).
+(define (bv-concat lst)
+  (let loop ((l lst) (acc (make-bytevector 0 0)))
+    (if (null? l) acc (loop (cdr l) (bytevector-append acc (car l))))))
+(define (resp-encode-command cmd)            ; cmd = (arg-bv ...)
+  (bv-concat
+   (cons (string->utf8 (string-append "*" (number->string (length cmd)) "\r\n"))
+         (map (lambda (a)
+                (bv-concat (list (string->utf8 (string-append "$" (number->string (bytevector-length a)) "\r\n"))
+                                 a (string->utf8 "\r\n"))))
+              cmd))))
+(define (encode-cmds queued) (bv-concat (map resp-encode-command queued)))
+
+; slot to put in a MOVED reply for a transaction (the first key's slot).
+(define (txn-slot queued)
+  (let loop ((cs queued))
+    (cond ((null? cs) 0)
+          ((pair? (cdr (car cs))) (key-slot (cadr (car cs))))
+          (else (loop (cdr cs))))))
+
+; the single shard a transaction targets, or 'crossslot if its keys span shards.
+(define (txn-shard cfg queued)
+  (let ((ns (cfg-nshards cfg)))
+    (let loop ((cs queued) (sh #f))
+      (if (null? cs) (or sh 0)
+          (let ((r (classify-route (string-upcase (utf8->string (caar cs))) (cdar cs) ns)))
+            (cond
+              ((eq? r 'crossslot) 'crossslot)
+              ((integer? r) (cond ((not sh) (loop (cdr cs) r))
+                                  ((= r sh) (loop (cdr cs) sh))
+                                  (else 'crossslot)))
+              (else (loop (cdr cs) sh))))))))   ; keyless command: doesn't pin a shard
+
+; EXEC: ship the queued commands to their shard's leader as ONE atomic EXEC-TXN
+; entry; the reply is the RESP array of per-command results (or MOVED/TRYAGAIN if
+; this node no longer leads, in which case the whole transaction must be retried).
+(define (exec-txn cfg queued)
+  (if (null? queued)
+      (r-array '())
+      (let ((shard (txn-shard cfg queued)))
+        (if (eq? shard 'crossslot)
+            (r-err "CROSSSLOT Keys in request don't hash to the same slot")
+            (let ((leader (table-lookup 'cc-shard-leader (local-qk cfg shard))))
+              (cond
+                ((not leader) (r-err "TRYAGAIN no leader for slot yet"))
+                ((eqv? leader (cfg-my-node cfg))
+                 (ask-local cfg shard (list (string->utf8 "EXEC-TXN") (encode-cmds queued))))
+                (else (let ((addr (node-addr leader (cfg-addrs cfg))))
+                        (if addr (r-err (string-append "MOVED " (number->string (txn-slot queued)) " " addr))
+                            (r-err "TRYAGAIN leader address unknown"))))))))))
+
+; advance txn state for one command -> (reply . txn').
+(define (txn-step cmd cfg txn)
+  (let ((name (string-upcase (utf8->string (car cmd)))))
+    (cond
+      ((string=? name "MULTI")
+       (if txn (cons (r-err "ERR MULTI calls can not be nested") txn)
+           (cons (r-ok) (cons '() #f))))
+      ((string=? name "DISCARD")
+       (if txn (cons (r-ok) #f) (cons (r-err "ERR DISCARD without MULTI") #f)))
+      ((string=? name "EXEC")
+       (cond ((not txn) (cons (r-err "ERR EXEC without MULTI") #f))
+             ((cdr txn) (cons (r-err "EXECABORT Transaction discarded because of previous errors.") #f))
+             (else (cons (exec-txn cfg (reverse (car txn))) #f))))
+      ((string=? name "WATCH")   ; not yet supported (no optimistic CAS) — fail loud
+       (cons (r-err "ERR WATCH is not supported by crab-cache") txn))
+      (txn (cons (r-simple "QUEUED") (cons (cons cmd (car txn)) (cdr txn))))   ; queue it
+      (else (cons (route-reply cmd cfg) #f)))))                                ; normal path
+
+; process a batch of commands threading txn state -> (out continue? txn').
+(define (serve-commands cmds cfg txn)
+  (let loop ((cs cmds) (out (make-bytevector 0 0)) (txn txn))
     (if (null? cs)
-        (cons out #t)
+        (list out #t txn)
         (let ((cmd (car cs)))
           (if (and (pair? cmd) (eq? (car cmd) 'protocol-error))
-              (cons (bytevector-append out (resp-encode (r-err (cadr cmd)))) #f)
-              (loop (cdr cs) (bytevector-append out (resp-encode (route-reply cmd cfg)))))))))
+              (list (bytevector-append out (resp-encode (r-err (cadr cmd)))) #f txn)
+              (let ((rt (txn-step cmd cfg txn)))
+                (loop (cdr cs) (bytevector-append out (resp-encode (car rt))) (cdr rt))))))))

@@ -1,0 +1,64 @@
+name: jepsen
+
+# Fast Scheme gates on every push; the full Jepsen soak on a nightly schedule or
+# manual dispatch (it needs the self-contained arm64 Docker cluster + ~30 min).
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *"        # nightly soak
+  workflow_dispatch:
+    inputs:
+      test_count:
+        description: "iterations per matrix cell"
+        default: "1"
+
+env:
+  # The interpreter is built from the crabscheme monorepo (separate repo). Override
+  # CRABSCHEME_REF to pin a commit/tag.
+  CRABSCHEME_REPO: crab-scheme/crabscheme
+  CRABSCHEME_REF: main
+
+jobs:
+  # Fast, runner-portable: build the interpreter, run the pure-engine raft tests and
+  # single-node conformance. No cluster, no Docker.
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch + build crabscheme
+        run: |
+          git clone --depth 1 --branch "$CRABSCHEME_REF" \
+            "https://github.com/${CRABSCHEME_REPO}.git" /tmp/crabscheme
+          cd /tmp/crabscheme
+          cargo build -p cs-cli --features stdlib-store --release
+          echo "CC=/tmp/crabscheme/target/release/crabscheme" >> "$GITHUB_ENV"
+      - name: Pure-engine raft tests (CheckQuorum/PreVote/ReadIndex round-ids)
+        run: "$CC" run test/raft-cq-prevote.scm
+      - name: Single-node conformance (both consistency modes)
+        run: |
+          bash bench/single-node.sh
+          # fast read path must also pass conformance
+          "$CC" run src/node.scm -- --port 7799 --db "$(mktemp -d)/cc" --shards 1 --consistency fast &
+          NODE=$!; for i in $(seq 1 50); do redis-cli -p 7799 ping >/dev/null 2>&1 && break; sleep 0.2; done
+          test "$(redis-cli -p 7799 set k v; redis-cli -p 7799 get k)" = "OK
+          v" && echo "fast-mode get OK"
+          kill $NODE
+
+  # Full distributed validation. Requires a self-hosted ARM64 runner with Docker
+  # (the node image bakes an arm64-Linux crabscheme — see jepsen/docker/). Runs the
+  # workload x fault matrix and fails only on a real anomaly or crash.
+  soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bring up the 5-node cluster
+        run: docker compose -f jepsen/docker/docker-compose.yml up -d --build
+      - name: Soak matrix
+        env:
+          TEST_COUNT: ${{ github.event.inputs.test_count || '2' }}
+        run: bash jepsen/bin/soak.sh
+      - name: Tear down
+        if: always()
+        run: docker compose -f jepsen/docker/docker-compose.yml down -v

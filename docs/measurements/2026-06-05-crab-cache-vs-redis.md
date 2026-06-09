@@ -91,6 +91,21 @@ across the failover — a passing linearizability witness.** (Attempts that
 errored during the brief leader-down window simply weren't acked — at-least-once,
 as expected; none were silently lost or duplicated.)
 
+### Formal validation (Jepsen)
+
+The witness above is now backed by a full Jepsen suite (5-node, fault injection;
+see [`docs/jepsen-validation.md`](../jepsen-validation.md)). Under partition and
+node-kill, with the default `--consistency linearizable` (Raft ReadIndex reads):
+**register is linearizable** (`:valid? true` no-fault + partition), **counter** has
+zero duplicate INCRs and monotone reads under kill, **cas-register is linearizable**,
+and **Elle list-append is strict-serializable** — the gold-standard test from the
+official jepsen-io/redis Redis-Raft analysis (which RedisRaft did not cleanly pass).
+Getting there required two consensus fixes the suite surfaced: read-path
+linearizability (cc-idc) and exactly-once acks for non-idempotent ops on stepdown
+(cc-cri). Caveat: clean verdicts use low concurrency + realistic client retry
+patience; the single-shard actor's throughput causes Knossos `:unknown` (not
+violations) at high load.
+
 ## Honest verdict
 
 crab-cache does **not** beat Redis on raw throughput, and it isn't meant to

@@ -1,0 +1,45 @@
+# A self-contained, arm64-native Jepsen cluster for crab-cache:
+#   control  — runs `lein run test ...`
+#   n1..n5   — DB nodes (resolve each other + control by name via compose DNS)
+#
+#   docker compose -f jepsen/docker/docker-compose.yml up -d --build
+#   docker compose -f jepsen/docker/docker-compose.yml exec control bash
+#     lein run test --workload register --nemesis none \
+#                   --nodes n1,n2,n3,n4,n5 --username root \
+#                   --ssh-private-key /root/.ssh/id_jepsen --time-limit 60
+name: crabcache-jepsen
+
+networks:
+  jepsen:
+    driver: bridge
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile.node
+  image: crabcache-jepsen-node
+  cap_add: [NET_ADMIN, SYS_TIME]   # NET_ADMIN: iptables partitions
+  networks: [jepsen]
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    image: crabcache-jepsen-control
+    container_name: jcc-control
+    networks: [jepsen]
+    volumes:
+      - ../../:/crab-cache          # live repo (the jepsen/ project)
+      - m2:/root/.m2                # cache lein deps across restarts
+    working_dir: /crab-cache/jepsen
+    command: ["sleep", "infinity"]
+
+  n1: {<<: *node, hostname: n1, container_name: jcc-n1}
+  n2: {<<: *node, hostname: n2, container_name: jcc-n2}
+  n3: {<<: *node, hostname: n3, container_name: jcc-n3}
+  n4: {<<: *node, hostname: n4, container_name: jcc-n4}
+  n5: {<<: *node, hostname: n5, container_name: jcc-n5}
+
+volumes:
+  m2:
