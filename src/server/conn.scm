@@ -209,12 +209,16 @@
         (if (= (bytevector-length chunk) 0)
             (tcp-close sock)
             (let* ((data (bytevector-append buf chunk))
-                   ; Native leading-GET fast-path (conn-serve-gets): fast mode only
-                   ; (serves cc-str locally with no leadership confirmation — not
-                   ; linearizable across elections, cc-idc). In linearizable mode (or a
-                   ; MULTI) GET goes through the interpreted path -> ReadIndex shard read.
-                   (fg (if (and (not txn) (cfg-fast? cfg))
-                           (conn-serve-gets data node ns)
+                   ; Native decode/classify/dispatch fast-path (conn-serve-batch,
+                   ; cc-5pw.2): serves a closed allowlist of side-effect-free verbs in
+                   ; Rust -- the 'any stateless verbs (PING/ECHO/SELECT/COMMAND/INFO/
+                   ; QUIT/TICK) in BOTH consistency modes, plus GET cc-str hits in fast
+                   ; mode only (linearizable GET must take the interpreted ReadIndex
+                   ; shard path, cc-idc). It stops at the first frame needing the
+                   ; interpreter, returning the bytes consumed. Skipped inside a MULTI
+                   ; (every command must queue). Superset of conn-serve-gets (kept as v1).
+                   (fg (if (not txn)
+                           (conn-serve-batch data node ns (cfg-fast? cfg))
                            (cons (make-bytevector 0 0) 0)))
                    (served (car fg)) (consumed (cdr fg))
                    (dlen (bytevector-length data)))
