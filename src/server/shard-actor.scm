@@ -121,13 +121,19 @@
     ; means we led — and on solo (no peers) no `engine` RPC ever arrives, so this
     ; never fires there and the single-node path is unchanged.
     (define (fail-pending!)
+      ; Writes still pending here are UNCOMMITTED at stepdown — the committed ones
+      ; were already drained + acked :ok before raft-step. Their outcome is genuinely
+      ; INDETERMINATE: the new leader may yet commit a replicated-but-uncommitted
+      ; entry (its no-op barrier commits the prior-term tail). So reply a NON-RETRYABLE
+      ; error — the client must NOT silently retry, or a non-idempotent write
+      ; (CAS/INCR/append) double-applies (cc-cri). "TRYAGAIN" would be retried; this
+      ; is recorded :info (indeterminate), which is the truthful outcome.
       (vector-for-each
-       (lambda (conn) (send conn (r-err "TRYAGAIN leadership changed")))
+       (lambda (conn) (send conn (r-err "ERR leadership changed mid-write; outcome indeterminate")))
        (hashtable-values pending))
       (hashtable-clear! pending)
-      ; Also abandon any in-flight ReadIndex reads (a round mid-confirmation +
-      ; those still queued): we can no longer confirm leadership for them, so the
-      ; client must retry against the real leader.
+      ; Reads are idempotent — TRYAGAIN so the client safely retries the GET against
+      ; the new leader (a ReadIndex round we can no longer confirm here).
       (for-each (lambda (e) (send (car e) (r-err "TRYAGAIN leadership changed"))) batch)
       (for-each (lambda (e) (send (car e) (r-err "TRYAGAIN leadership changed"))) read-q)
       (set! batch '()) (set! read-q '()) (set! read-acks '()) (set! round-open? #f))
@@ -286,10 +292,24 @@
                  ;; ---- all other RPCs (rv / rvr / ae / aer): the normal Raft step
                  (else
                   (let* ((was-leader? (raft-leader? st))    ; role BEFORE this RPC steps us
+                         ; A higher-term ae/rv/aer/rvr will depose us. BEFORE raft-step
+                         ; truncates our uncommitted tail, ACK our COMMITTED deferred batch
+                         ; (fsync + drain) while acc/pending are still aligned — so a
+                         ; committed non-idempotent write (CAS/INCR/append) is reported :ok
+                         ; and the client does NOT silently retry it after stepdown (cc-cri).
+                         ; Committed = quorum-durable (Leader Completeness), so acking is
+                         ; safe; only the genuinely-uncommitted tail is then TRYAGAIN'd by
+                         ; fail-pending!. flush-base is consumed here, so pass #f onward.
+                         (depose? (and was-leader?
+                                       (memq (car rpc) '(ae rv aer rvr))
+                                       (> (list-ref rpc 1) (raft-term st))))
+                         (fb (if (and depose? flush-base)
+                                 (begin (flush-and-drain! flush-base) #f)
+                                 flush-base))
                          (old (raft-applied st))
                          (r (raft-step st from rpc)) (st2 (car r)))
-                    ; leader -> follower: abandon our in-flight proposals (TRYAGAIN +
-                    ; clear pending) BEFORE any drain! can cross-wire them (cc-idc / H1).
+                    ; leader -> follower: TRYAGAIN the remaining (now uncommitted) in-flight
+                    ; proposals + clear pending, before any drain! can cross-wire them (H1).
                     (if (and was-leader? (not (raft-leader? st2))) (fail-pending!))
                     ; record the new applied-index in the batch BEFORE the fsync below
                     (if (> (raft-applied st2) old) (persist-applied! st2))
@@ -302,7 +322,7 @@
                     (if (and (not (raft-leader? st2)) (ctx-dirty? ctx)) (ctx-flush! ctx))
                     (emit! (cdr r))
                     ; defer (leader, has waiters) or ack inline (follower) the applied entries
-                    (let ((nb (settle! (raft-leader? st2) old flush-base)))
+                    (let ((nb (settle! (raft-leader? st2) old fb)))
                       ; ReadIndex: an AER may be a fresh confirmation ack; note-read-ack!
                       ; counts it (success + current term + rseq >= round) and releases
                       ; the batch on quorum. Returns st (rseq-bumped if a round opened).
