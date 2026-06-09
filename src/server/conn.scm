@@ -19,6 +19,7 @@
 
 (define (cfg-my-node cfg) (list-ref cfg 5))
 (define (cfg-addrs cfg)   (list-ref cfg 6))
+(define (cfg-fast? cfg)   (list-ref cfg 7))   ; #t = fast cc-str GET; #f = ReadIndex (default)
 (define (node-addr nd addrs) (let ((p (assq nd addrs))) (and p (cdr p))))
 (define (local-qk cfg s) (string-append (symbol->string (cfg-my-node cfg)) ":" (number->string s)))
 (define (broker-pid cfg) (table-lookup 'cc-broker (symbol->string (cfg-my-node cfg))))
@@ -125,10 +126,12 @@
            ((eq? r 'cluster) (cluster-reply operands cfg))
            ((eq? r 'all) (aggregate-replies name (fan-out-direct cmd cfg)))
            ((eq? r 'any) (stateless-reply name operands))
-           ; GET is routed to the shard leader for a linearizable ReadIndex read
-           ; (Raft §6.4): the conn-local cc-str fast-path (get-fast) cannot confirm
-           ; current leadership, so a deposed leader would serve stale values (cc-idc).
-           ((string=? name "GET") (route-to-shard cfg r cmd))
+           ; GET: linearizable mode (default) routes to the shard for a ReadIndex read
+           ; (Raft §6.4 — the conn-local cc-str path can't confirm leadership, so a
+           ; deposed leader would serve stale values, cc-idc); fast mode serves the
+           ; cc-str cache locally (faster, non-linearizable across elections).
+           ((string=? name "GET")
+            (if (cfg-fast? cfg) (get-fast cfg r operands cmd) (route-to-shard cfg r cmd)))
            (else (route-to-shard cfg r cmd))))))))
 
 ; ---- subscriber mode ----
@@ -206,12 +209,13 @@
         (if (= (bytevector-length chunk) 0)
             (tcp-close sock)
             (let* ((data (bytevector-append buf chunk))
-                   ; The native leading-GET fast-path (conn-serve-gets) is disabled:
-                   ; it serves cc-str locally with no leadership confirmation, which
-                   ; is not linearizable across elections (cc-idc). GET now routes to
-                   ; the shard for a ReadIndex read, so all data goes through the
-                   ; interpreted/txn path (same as while a MULTI is open).
-                   (fg (cons (make-bytevector 0 0) 0))
+                   ; Native leading-GET fast-path (conn-serve-gets): fast mode only
+                   ; (serves cc-str locally with no leadership confirmation — not
+                   ; linearizable across elections, cc-idc). In linearizable mode (or a
+                   ; MULTI) GET goes through the interpreted path -> ReadIndex shard read.
+                   (fg (if (and (not txn) (cfg-fast? cfg))
+                           (conn-serve-gets data node ns)
+                           (cons (make-bytevector 0 0) 0)))
                    (served (car fg)) (consumed (cdr fg))
                    (dlen (bytevector-length data)))
               (if (> (bytevector-length served) 0) (tcp-send sock served))

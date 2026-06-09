@@ -21,6 +21,11 @@
 (define host    (arg-after "--host" "127.0.0.1"))
 (define nshards (string->number (arg-after "--shards" "3")))
 (define durable (string=? (arg-after "--durable" "no") "yes"))  ; fsync each write
+; --consistency linearizable (default) routes GET through the shard for a ReadIndex
+; read (cc-idc-safe); fast serves GET from the conn-local cc-str cache (faster, but
+; not linearizable across leader elections). PreVote/CheckQuorum/fail-pending! stay
+; on in both modes (free correctness/stability).
+(define fast? (string=? (arg-after "--consistency" "linearizable") "fast"))
 (define node-name 'n)
 
 ; a 40-hex-char node id derived from the node name (Redis-cluster shaped)
@@ -56,7 +61,7 @@
           (loop (+ i 1) (cons (list (car rng) (cdr rng) host port node-id) acc))))))
 ; single node => it leads every shard; nothing is ever MOVED.
 (define addrs (list (cons node-name (string-append host ":" (number->string port)))))
-(table-insert! 'cc-config "cfg" (list host port nshards node-id ranges node-name addrs))
+(table-insert! 'cc-config "cfg" (list host port nshards node-id ranges node-name addrs fast?))
 
 ; spawn one shard-replica per shard (own DB dir, 1-voter group = this node)
 (let loop ((i 0))
@@ -68,7 +73,7 @@
         ; throughput. (green-threads INV-2.)
         (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
                       (number->string i) (list node-name) node-name
-                      (string-append dbbase "-shard" (number->string i)) durable)
+                      (string-append dbbase "-shard" (number->string i)) durable fast?)
         (loop (+ i 1)))))
 
 ; wait until every shard has published its pid (so routing always resolves)

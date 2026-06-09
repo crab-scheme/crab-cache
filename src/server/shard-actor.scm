@@ -60,7 +60,7 @@
      "SADD" "SREM" "SPOP" "ZADD" "ZREM" "ZINCRBY" "FLUSHALL" "FLUSHDB"
      "EXEC-TXN")))
 
-(define (shard-main shard-key voters node-name db-path sync?)
+(define (shard-main shard-key voters node-name db-path sync? fast?)
   (let* ((handle  (store-open db-path))
          (ctx     (make-ctx handle "default" sync?))
          (pending (make-eqv-hashtable))            ; log-index -> conn-pid
@@ -378,11 +378,12 @@
                  ((not (raft-leader? st))
                   (send conn (r-err "TRYAGAIN shard not leader")) (loop st leader elapsed flush-base))
                  ((not (write-cmd? name))
-                  ; READ. Solo: serve inline (always the sole leader — no quorum to
-                  ; confirm, and a round would never complete). Multi-voter: ReadIndex
-                  ; — enqueue + (if idle) open a confirmation round; the reply is sent
-                  ; from serve-batch! once a quorum AER confirms we still lead.
-                  (if solo
+                  ; READ. Serve inline when solo (sole leader — a round would never
+                  ; complete) OR in fast mode (the conn already prefers cc-str; a shard
+                  ; read here just warms it, no linearizability promise). Otherwise
+                  ; (linearizable, multi-voter) ReadIndex: enqueue + (if idle) open a
+                  ; confirmation round; serve-batch! replies once a quorum AER confirms.
+                  (if (or solo fast?)
                       (begin (send conn (shard-dispatch ctx cmd))
                              (loop st leader elapsed flush-base))
                       (begin (set! read-q (cons (cons conn cmd) read-q))

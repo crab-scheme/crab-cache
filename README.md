@@ -33,6 +33,12 @@ CC=…/crabscheme/target/release/crabscheme
 $CC run src/node.scm -- --port 6400 --db /tmp/cc --shards 3
 redis-cli -p 6400 set foo bar && redis-cli -p 6400 get foo
 
+# reliability vs speed: GET is linearizable by default (a Raft ReadIndex read —
+# Jepsen register :valid? true under partition). Add --consistency fast to serve GET
+# from the conn-local cc-str cache instead (faster, but NOT linearizable across leader
+# elections). Writes, PreVote/CheckQuorum, and recovery are identical in both modes.
+$CC run src/node.scm -- --port 6400 --db /tmp/cc --shards 3 --consistency fast
+
 # clusters + the gates
 bash bench/cluster.sh failover      # AS-3: kill leader, no acked-write loss
 bash bench/cluster.sh rejoin        # downed node restarts + converges
