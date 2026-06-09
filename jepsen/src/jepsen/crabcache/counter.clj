@@ -40,17 +40,22 @@
 
 (defn counter-checker
   "Assert-free counter analysis (jepsen's built-in checker/counter is strict about
-   value types). INCR is fetch-and-add, so every acknowledged INCR must return a
-   DISTINCT value — duplicates mean a double-apply / non-idempotent replay
-   (crab-cache's known gap) — and a later read must not fall below the largest
-   acknowledged INCR, which would mean a lost acknowledged increment."
+   value types). INCR is fetch-and-add, so two real violations:
+   (1) duplicate INCR returns — a double-apply / non-idempotent replay; and
+   (2) a NON-MONOTONE read — a successful read returning a value strictly below one
+       an EARLIER successful read already observed, i.e. the counter went backwards
+       = a stale / lost acknowledged increment.
+   NOTE the older `max-read < max-incr` proxy is kept INFORMATIONAL only: it
+   false-positives whenever the counter climbs past the last *successful* read (e.g.
+   the final per-thread reads all time out under kill), so it does not fail the check
+   — only an actually-observed decrease does."
   []
   (reify checker/Checker
     (check [this test history opts]
       (let [adds   (->> history
                         (filter #(and (= :ok (:type %)) (= :add (:f %))))
                         (keep :incr-result))
-            reads  (->> history
+            reads  (->> history          ; in time order (history is ordered)
                         (filter #(and (= :ok (:type %)) (= :read (:f %))))
                         (keep :value)
                         (filter number?))
@@ -59,14 +64,24 @@
                         (into (sorted-map)))
             max-add  (when (seq adds)  (apply max adds))
             max-read (when (seq reads) (apply max reads))
-            lost?    (boolean (and max-add max-read (< max-read max-add)))]
-        {:valid?                  (and (empty? dups) (not lost?))
+            ;; monotonicity: each [prev-max observed] where a read fell below the max
+            ;; a prior read had already observed (a genuine backwards/stale read).
+            backwards (->> reads
+                           (reduce (fn [[mx hits] v]
+                                     [(max mx v) (if (< v mx) (conj hits [mx v]) hits)])
+                                   [##-Inf []])
+                           second)
+            non-monotonic? (boolean (seq backwards))]
+        {:valid?                  (and (empty? dups) (not non-monotonic?))
          :acked-incrs             (count adds)
          :distinct-incr-returns   (count (distinct adds))
          :duplicate-incr-returns  dups
+         :backwards-reads         backwards
+         :non-monotonic-reads?    non-monotonic?
          :max-incr-return         max-add
          :max-read-observed       max-read
-         :lost-update?            lost?}))))
+         ;; informational only (false-positives when reads stop before the counter peaks):
+         :reads-below-max-incr?   (boolean (and max-add max-read (< max-read max-add)))}))))
 
 ;; Ops are FUNCTIONS, not bare maps: a literal op-map is a generator that emits
 ;; itself once and exhausts, so (gen/mix [m m m]) would stop after a few ops.
