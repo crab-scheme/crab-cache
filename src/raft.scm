@@ -53,6 +53,8 @@
   (if (or (<= n 0) (null? lst)) '()
       (cons (car lst) (take-n (cdr lst) (- n 1)))))
 
+(define (add-mem x lst) (if (memv x lst) lst (cons x lst)))  ; set-cons (eqv?)
+
 ; ============================================================
 ; node construction + accessors
 ; ============================================================
@@ -68,7 +70,14 @@
         ; the original positional log. It advances on solo compaction and is
         ; restored from RocksDB on restart so committed entries are never
         ; re-applied (idempotent recovery/rejoin).
-        (cons 'base 0) (cons 'base-term 0)))
+        (cons 'base 0) (cons 'base-term 0)
+        ; CheckQuorum: `heard` = peers whose AER arrived this window (set by
+        ; on-aer); `q-ticks` = ticks since the last quorum check (raft-checkquorum).
+        ; PreVote: `pre-votes` = pre-vote grants tallied while a `pre-candidate`.
+        ; ReadIndex: `rseq` = monotone read-sequence stamped on every AE and echoed
+        ; in the AER, so the leader counts only confirmation acks that reply to a
+        ; heartbeat sent AFTER a read was issued (Raft §6.4 freshness).
+        (cons 'heard '()) (cons 'q-ticks 0) (cons 'pre-votes '()) (cons 'rseq 0)))
 
 (define (raft-id st)      (aget st 'id))
 (define (raft-role st)    (aget st 'role))
@@ -98,16 +107,24 @@
   (let* ((nx (cdr (assq peer (aget st 'next))))
          (prev (- nx 1)))
     (list 'ae (aget st 'term) (aget st 'id) prev (entry-term st prev)
-          (entries-from st nx) (aget st 'commit))))
+          (entries-from st nx) (aget st 'commit) (aget st 'rseq))))  ; +rseq (ReadIndex)
 
 (define (broadcast-append st)
   (cons st (map (lambda (p) (cons p (append-for st p))) (aget st 'peers))))
 
 (define (become-leader st)
-  (let* ((nx (+ 1 (log-len st)))
+  ; §5.4.2 / §6.4 no-op barrier: a fresh leader appends an empty entry in its OWN
+  ; term and commits it, which advances its commit/applied past every prior-term
+  ; committed entry (Leader Completeness) — so a ReadIndex read it serves reflects
+  ; all committed writes, never stale state from before its election. The no-op's
+  ; command is '() (a real command always has a name bv), recognised + skipped by
+  ; apply-fn. It also survives node-send replication (unlike nested lists).
+  (let* ((st (aset st 'log (append (aget st 'log) (list (cons (aget st 'term) '())))))
+         (nx (+ 1 (log-len st)))
          (st (aset* st (list 'role 'leader
                              'next (map (lambda (p) (cons p nx)) (aget st 'peers))
-                             'match (map (lambda (p) (cons p 0)) (aget st 'peers))))))
+                             'match (map (lambda (p) (cons p 0)) (aget st 'peers))
+                             'q-ticks 0 'heard '()))))   ; fresh CheckQuorum lease
     (broadcast-append st)))
 
 ; ============================================================
@@ -161,6 +178,39 @@
 (define (raft-tick st)
   (if (raft-leader? st) (broadcast-append st) (cons st '())))
 
+; CheckQuorum (Ongaro thesis §6.2): a leader that has NOT been contacted by a
+; quorum within an election-timeout `window` steps DOWN to follower. This makes an
+; isolated/minority former leader stop believing it leads, so the cache's read
+; fast-path (get-fast, gated on cc-shard-leader) stops serving stale values once
+; the driver republishes the demotion. `heard` (peers whose AER arrived) is
+; accumulated by on-aer; it is reset here every `window` ticks. Pure: a non-leader
+; is unchanged, and solo (majority 1, self always counts) renews unconditionally.
+(define (raft-checkquorum st window)
+  (if (not (raft-leader? st)) st
+      (let ((q (+ 1 (aget st 'q-ticks))))
+        (if (< q window)
+            (aset st 'q-ticks q)                                   ; window not up yet
+            (if (>= (+ 1 (length (aget st 'heard))) (majority st))
+                (aset* st (list 'q-ticks 0 'heard '()))            ; quorum seen -> renew
+                (aset* st (list 'role 'follower 'voted-for #f      ; lost quorum -> step down
+                                'q-ticks 0 'heard '())))))))
+
+; PreVote (Ongaro thesis §9.6): before a real election, a timed-out follower sends
+; a pre-vote (prv) WITHOUT bumping its term and becomes a `pre-candidate`. A peer
+; grants only if it has itself seen no live leader (driver gate: elapsed >= its
+; election timeout) and the pre-candidate's log is at least as up-to-date. Only on
+; a pre-vote majority does the driver call raft-campaign (which bumps the term).
+; This stops a partitioned or momentarily-slow node from disrupting a healthy
+; leader via term inflation — the cure for spurious-election churn. Pure: returns
+; (pre-candidate-node . prv-outputs).
+(define (raft-prevote st)
+  (let* ((id (aget st 'id))
+         (st (aset* st (list 'role 'pre-candidate 'pre-votes (list id)))))
+    (cons st (map (lambda (p)
+                    (cons p (list 'prv (+ 1 (aget st 'term)) id
+                                  (log-len st) (last-log-term st))))
+                  (aget st 'peers)))))
+
 (define (raft-step st from msg)
   (case (car msg)
     ((rv)  (on-rv st msg))
@@ -197,13 +247,14 @@
 (define (on-ae st msg)
   (let ((term (list-ref msg 1)) (leader (list-ref msg 2))
         (pidx (list-ref msg 3)) (pterm (list-ref msg 4))
-        (entries (list-ref msg 5)) (lc (list-ref msg 6)))
+        (entries (list-ref msg 5)) (lc (list-ref msg 6))
+        (rseq (list-ref msg 7)))                              ; ReadIndex round id to echo
     (if (< term (aget st 'term))
-        (cons st (list (cons leader (list 'aer (aget st 'term) #f 0))))
+        (cons st (list (cons leader (list 'aer (aget st 'term) #f 0 rseq))))
         (let* ((st (aset* st (list 'term term 'role 'follower)))
                (ok (and (<= pidx (log-len st)) (= (entry-term st pidx) pterm))))
           (if (not ok)
-              (cons st (list (cons leader (list 'aer (aget st 'term) #f 0))))
+              (cons st (list (cons leader (list 'aer (aget st 'term) #f 0 rseq))))
               (let* ((b (aget st 'base))
                      (kept (take-n (aget st 'log) (- pidx b)))   ; keep base+1..pidx
                      (newlog (append kept entries))
@@ -212,7 +263,7 @@
                      (st (if (> lc (aget st 'commit))
                              (apply-committed (aset st 'commit (min lc (+ b (length newlog)))))
                              st)))
-                (cons st (list (cons leader (list 'aer (aget st 'term) #t midx))))))))))
+                (cons st (list (cons leader (list 'aer (aget st 'term) #t midx rseq))))))))))
 
 (define (on-aer st from msg)
   (let ((term (list-ref msg 1)) (succ (list-ref msg 2)) (midx (list-ref msg 3)))
@@ -220,13 +271,17 @@
       ((> term (aget st 'term))
        (cons (aset* st (list 'term term 'role 'follower 'voted-for #f)) '()))
       ((not (and (raft-leader? st) (= term (aget st 'term)))) (cons st '()))
+      ; Any AER (success OR rejection) proves this peer reached us this window —
+      ; record it for CheckQuorum (raft-checkquorum counts `heard` + self).
       (succ
        (let ((st (aset* st (list 'match (aset (aget st 'match) from midx)
-                                 'next (aset (aget st 'next) from (+ midx 1))))))
+                                 'next (aset (aget st 'next) from (+ midx 1))
+                                 'heard (add-mem from (aget st 'heard))))))
          (cons (maybe-commit st) '())))
       (else
        (let* ((nx (cdr (assq from (aget st 'next))))
-              (st (aset st 'next (aset (aget st 'next) from (max 1 (- nx 1))))))
+              (st (aset* st (list 'next (aset (aget st 'next) from (max 1 (- nx 1)))
+                                  'heard (add-mem from (aget st 'heard))))))
          (cons st (list (cons from (append-for st from)))))))))
 
 ; ============================================================

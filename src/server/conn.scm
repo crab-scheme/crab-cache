@@ -125,7 +125,10 @@
            ((eq? r 'cluster) (cluster-reply operands cfg))
            ((eq? r 'all) (aggregate-replies name (fan-out-direct cmd cfg)))
            ((eq? r 'any) (stateless-reply name operands))
-           ((string=? name "GET") (get-fast cfg r operands cmd))   ; conn-local in-memory read
+           ; GET is routed to the shard leader for a linearizable ReadIndex read
+           ; (Raft §6.4): the conn-local cc-str fast-path (get-fast) cannot confirm
+           ; current leadership, so a deposed leader would serve stale values (cc-idc).
+           ((string=? name "GET") (route-to-shard cfg r cmd))
            (else (route-to-shard cfg r cmd))))))))
 
 ; ---- subscriber mode ----
@@ -203,11 +206,12 @@
         (if (= (bytevector-length chunk) 0)
             (tcp-close sock)
             (let* ((data (bytevector-append buf chunk))
-                   ; perf cc-5pw.3: serve the LEADING run of locally-led GET hits
-                   ; entirely in Rust. BUT in MULTI those GETs must be QUEUED, not
-                   ; served — so bypass the native fast-path while a transaction is
-                   ; open and route everything through the interpreted/txn path.
-                   (fg (if txn (cons (make-bytevector 0 0) 0) (conn-serve-gets data node ns)))
+                   ; The native leading-GET fast-path (conn-serve-gets) is disabled:
+                   ; it serves cc-str locally with no leadership confirmation, which
+                   ; is not linearizable across elections (cc-idc). GET now routes to
+                   ; the shard for a ReadIndex read, so all data goes through the
+                   ; interpreted/txn path (same as while a MULTI is open).
+                   (fg (cons (make-bytevector 0 0) 0))
                    (served (car fg)) (consumed (cdr fg))
                    (dlen (bytevector-length data)))
               (if (> (bytevector-length served) 0) (tcp-send sock served))
