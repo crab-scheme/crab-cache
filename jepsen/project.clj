@@ -3,7 +3,7 @@
   :url "https://github.com/crab-scheme/crab-cache"
   :license {:name "MIT"}
   :main jepsen.crabcache.core
-  :jvm-opts ["-Xmx4g"
+  :jvm-opts ["-Xmx10g"      ; 5-node history + per-key Knossos analysis + save-2! serialization
              "-Djava.awt.headless=true"
              ;; Knossos / Elle want a deep stack on big histories.
              "-server"]

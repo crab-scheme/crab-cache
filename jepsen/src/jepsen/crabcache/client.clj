@@ -55,11 +55,11 @@
                 (or (classify-error e) (throw e))))]
       (case (nth r 0)
         :ok       (nth r 1)
-        :moved    (if (< redirects 15)
+        :moved    (if (< redirects 100)
                     (do (reset! node-atom (nth r 1))
                         (recur (inc redirects) retries))
                     (throw (ex-info "too many MOVED redirects" {:redirects redirects})))
-        :tryagain (if (< retries 50)
+        :tryagain (if (< retries 100)
                     (do (Thread/sleep 100)
                         (recur redirects (inc retries)))
                     (throw (ex-info "no leader after TRYAGAIN retries" {:retries retries})))))))
